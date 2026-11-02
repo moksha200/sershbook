@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+playwright
+aiomysql
+httpx
+yt-dlp
+pydantic
