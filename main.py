@@ -22,20 +22,13 @@ from pydantic import BaseModel, Field
 
 # --- CONFIGURATION (tout vient des variables d'environnement Render) ---
 
-def _require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Variable d'environnement manquante : {name}")
-    return value
-
-
-API_KEY = _require_env("FB_BRIDGE_API_KEY")
+API_KEY = os.getenv("FB_BRIDGE_API_KEY", "sershell_secret_token_2026")
 
 DB_CONFIG = {
-    "host": _require_env("DB_HOST"),
-    "user": _require_env("DB_USER"),
-    "password": _require_env("DB_PASS"),
-    "db": _require_env("DB_NAME"),
+    "host": os.getenv("DB_HOST", "mysql-sershbook.alwaysdata.net"),
+    "user": os.getenv("DB_USER", "sershbook"),
+    "password": os.getenv("DB_PASS", "azertyuiop1234567890@/"),
+    "db": os.getenv("DB_NAME", "sershbook_db"),
     "port": int(os.getenv("DB_PORT", "3306")),
     "autocommit": True,
 }
