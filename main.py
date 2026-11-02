@@ -41,35 +41,26 @@ class SearchRequest(BaseModel):
 
 class PublishRequest(BaseModel):
     content: str = Field(..., description="Texte complet de la publication (rédigé par l'IA).")
-    media_url: Optional[str] = Field(
-        default=None,
-        description="Optionnel : URL publique (HTTP/HTTPS) ou chemin local d'une photo ou d'une vidéo à publier."
-    )
-    media_base64: Optional[str] = Field(
-        default=None,
-        description="Optionnel : Fichier photo/vidéo encodé en Base64 si l'IA envoie directement le binaire."
-    )
-    media_filename: Optional[str] = Field(
-        default="media.mp4",
-        description="Nom du fichier avec son extension (ex: 'image.jpg' ou 'video.mp4') lors de l'utilisation de media_base64."
-    )
+    media_url: Optional[str] = Field(default=None)
+    media_base64: Optional[str] = Field(default=None)
+    media_filename: Optional[str] = Field(default="media.mp4")
 
 class CommentRequest(BaseModel):
-    post_url: str = Field(..., description="URL complète du post ou de la vidéo Facebook où commenter.")
-    comment_text: str = Field(..., description="Texte du commentaire ou de la réponse à publier.")
+    post_url: str = Field(...)
+    comment_text: str = Field(...)
 
 class LikeRequest(BaseModel):
-    post_url: str = Field(..., description="URL complète du post ou de la vidéo Facebook à liker.")
+    post_url: str = Field(...)
 
 class ReadPostRequest(BaseModel):
-    post_url: str = Field(..., description="URL de la publication Facebook dont l'IA veut lire le contenu et les commentaires.")
-    max_comments: int = Field(default=10, ge=1, le=30, description="Nombre maximum de commentaires à extraire.")
+    post_url: str = Field(...)
+    max_comments: int = Field(default=10, ge=1, le=30)
 
 class VideoAnalyzeRequest(BaseModel):
-    video_url: str = Field(..., description="URL de la vidéo Facebook (Reel, Watch, Post) ou externe à analyser par l'IA.")
+    video_url: str = Field(...)
 
 
-# --- MOTEUR D'AUTOMATISATION MULTI-IA OPTIMISÉ POUR DOCKER ---
+# --- MOTEUR D'AUTOMATISATION MULTI-IA ---
 
 class UniversalFacebookBridge:
     def __init__(self):
@@ -122,7 +113,6 @@ class UniversalFacebookBridge:
         custom_env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/dev/null"
         custom_env["DISPLAY"] = ""
 
-        # Note : executable_path est omis pour laisser Playwright utiliser le Chromium système de Docker
         self.browser = await self.playwright.chromium.launch(
             headless=True,
             env=custom_env,
@@ -142,8 +132,8 @@ class UniversalFacebookBridge:
         )
 
         self.context = await self.browser.new_context(
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-            viewport={"width": 414, "height": 896},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
             locale="fr-FR"
         )
 
@@ -247,7 +237,15 @@ class UniversalFacebookBridge:
             raise RuntimeError(f"Échec préparation média : {e}")
 
     async def _extract_dom_posts(self, page, limit: int) -> List[Dict[str, Any]]:
+        """Extrait le texte propre en ignorant totalement les balises <script> et <style>."""
         return await page.evaluate("""(maxItems) => {
+            const getCleanText = (node) => {
+                const clone = node.cloneNode(true);
+                const scriptNodes = clone.querySelectorAll('script, style, noscript, svg, template');
+                scriptNodes.forEach(s => s.remove());
+                return (clone.textContent || "").replace(/\\s+/g, " ").trim();
+            };
+
             const articles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-story-id]'));
             const results = [];
             const seenTexts = new Set();
@@ -255,7 +253,7 @@ class UniversalFacebookBridge:
             for (const el of articles) {
                 if (results.length >= maxItems) break;
 
-                const rawText = (el.textContent || "").replace(/\\s+/g, " ").trim();
+                const rawText = getCleanText(el);
                 if (rawText.length < 15 || seenTexts.has(rawText.slice(0, 100))) continue;
                 seenTexts.add(rawText.slice(0, 100));
 
@@ -263,7 +261,7 @@ class UniversalFacebookBridge:
                 const links = Array.from(el.querySelectorAll('a[href]'));
                 for (const a of links) {
                     const href = a.href;
-                    if (href.includes('/posts/') || href.includes('/videos/') || href.includes('/reel/') || href.includes('story_fbid=') || href.includes('/story.php')) {
+                    if (href.includes('/posts/') || href.includes('/videos/') || href.includes('/reel/') || href.includes('story_fbid=') || href.includes('/permalink/')) {
                         postUrl = href.split('?')[0];
                         if (href.includes('story_fbid=')) postUrl = href;
                         break;
@@ -272,8 +270,8 @@ class UniversalFacebookBridge:
 
                 let author = "Auteur Facebook";
                 const heading = el.querySelector('h3, h4, strong, a');
-                if (heading && heading.textContent) {
-                    author = heading.textContent.replace(/\\s+/g, " ").trim();
+                if (heading) {
+                    author = getCleanText(heading);
                 }
 
                 results.push({
@@ -294,22 +292,23 @@ class UniversalFacebookBridge:
                 try:
                     page = await self.get_page()
                     encoded_q = urllib.parse.quote(query)
-                    target_url = f"https://m.facebook.com/search/posts/?q={encoded_q}"
+                    target_url = f"https://www.facebook.com/search/posts/?q={encoded_q}"
 
                     await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
-                    await page.evaluate("window.scrollBy(0, 800)")
+                    await asyncio.sleep(4)
+                    await page.evaluate("window.scrollBy(0, 1000)")
                     await asyncio.sleep(2)
 
                     posts = await self._extract_dom_posts(page, limit)
 
                     if not posts:
                         fallback_text = await page.evaluate("""() => {
-                            const main = document.querySelector('div#root') || document.body;
-                            return (main.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 3000);
+                            const clone = document.body.cloneNode(true);
+                            clone.querySelectorAll('script, style, noscript, svg').forEach(s => s.remove());
+                            return (clone.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 2000);
                         }""")
                         if fallback_text:
-                            posts = [{"author": "Flux Facebook Mobile", "post_url": target_url, "content": fallback_text}]
+                            posts = [{"author": "Résultat extrait", "post_url": target_url, "content": fallback_text}]
                     return posts
                 except Exception as e:
                     print(f"[RETRY SEARCH] Tentative {attempt+1}/3 : {e}")
@@ -329,9 +328,9 @@ class UniversalFacebookBridge:
                 page = None
                 try:
                     page = await self.get_page()
-                    await page.goto("https://m.facebook.com/", wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
-                    await page.evaluate("window.scrollBy(0, 1000)")
+                    await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(4)
+                    await page.evaluate("window.scrollBy(0, 1200)")
                     await asyncio.sleep(2)
                     return await self._extract_dom_posts(page, limit)
                 except Exception as e:
@@ -355,13 +354,13 @@ class UniversalFacebookBridge:
                     page = await self.get_page()
                     temp_media_path = await self._prepare_temp_media(media_url, media_base64, filename)
 
-                    await page.goto("https://m.facebook.com/", wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
+                    await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(4)
 
                     composer_triggers = [
-                        'textarea[name="xc_message"]',
                         'div[role="button"]:has-text("Que voulez-vous dire")',
                         'div[role="button"]:has-text("Exprimez-vous")',
+                        'div[role="button"]:has-text("What\'s on your mind")',
                         'span:has-text("Que voulez-vous dire")'
                     ]
                     clicked = False
@@ -384,12 +383,12 @@ class UniversalFacebookBridge:
                             is_video = temp_media_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
                             await asyncio.sleep(10 if is_video else 4)
 
-                    textbox = page.locator('textarea, div[role="textbox"][contenteditable="true"]').first
+                    textbox = page.locator('div[role="dialog"] div[role="textbox"][contenteditable="true"], div[role="textbox"][contenteditable="true"]').first
                     await textbox.click(force=True)
                     await textbox.fill(content)
                     await asyncio.sleep(2)
 
-                    publish_btn = page.locator('button[name="submit"], div[aria-label="Publier"], div[aria-label="Post"]').first
+                    publish_btn = page.locator('div[aria-label="Publier"], div[aria-label="Post"], div[role="button"]:has-text("Publier")').first
                     await publish_btn.click(force=True)
                     await asyncio.sleep(5)
 
@@ -417,13 +416,12 @@ class UniversalFacebookBridge:
                 page = None
                 try:
                     page = await self.get_page()
-                    mobile_url = post_url.replace("www.facebook.com", "m.facebook.com")
-                    await page.goto(mobile_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(4)
 
                     comment_boxes = [
-                        'textarea[name="comment_text"]',
                         'div[aria-label*="Écrivez un commentaire"]',
+                        'div[aria-label*="Write a comment"]',
                         'div[role="textbox"][contenteditable="true"]'
                     ]
                     target_box = None
@@ -439,12 +437,7 @@ class UniversalFacebookBridge:
                     await target_box.click(force=True)
                     await target_box.fill(comment_text)
                     await asyncio.sleep(1)
-                    
-                    submit_btn = page.locator('button[type="submit"], input[type="submit"]').first
-                    if await submit_btn.count() > 0:
-                        await submit_btn.click(force=True)
-                    else:
-                        await page.keyboard.press("Enter")
+                    await page.keyboard.press("Enter")
                     await asyncio.sleep(4)
 
                     return {"commented": True, "post_url": post_url, "comment": comment_text}
@@ -466,14 +459,13 @@ class UniversalFacebookBridge:
                 page = None
                 try:
                     page = await self.get_page()
-                    mobile_url = post_url.replace("www.facebook.com", "m.facebook.com")
-                    await page.goto(mobile_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(4)
 
                     like_selectors = [
-                        'a:has-text("J’aime")',
-                        'a:has-text("J\'aime")',
-                        'div[aria-label="J’aime"][role="button"]'
+                        'div[aria-label="J’aime"][role="button"]',
+                        'div[aria-label="J\'aime"][role="button"]',
+                        'div[aria-label="Like"][role="button"]'
                     ]
                     for sel in like_selectors:
                         loc = page.locator(sel).first
@@ -501,14 +493,23 @@ class UniversalFacebookBridge:
                 page = None
                 try:
                     page = await self.get_page()
-                    mobile_url = post_url.replace("www.facebook.com", "m.facebook.com")
-                    await page.goto(mobile_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(3)
+                    await page.goto(post_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(4)
 
                     data = await page.evaluate("""(maxComm) => {
-                        const mainElem = document.querySelector('div#root') || document.body;
-                        const mainText = (mainElem.textContent || "").replace(/\\s+/g, " ").trim();
-                        return { main_post: mainText.slice(0, 2500), comments: [] };
+                        const getCleanText = (node) => {
+                            const clone = node.cloneNode(true);
+                            clone.querySelectorAll('script, style, noscript, svg, template').forEach(s => s.remove());
+                            return (clone.textContent || "").replace(/\\s+/g, " ").trim();
+                        };
+                        const articles = Array.from(document.querySelectorAll('div[role="article"]'));
+                        const mainPost = articles.length > 0 ? getCleanText(articles[0]) : "";
+                        const comments = [];
+                        for (let i = 1; i < articles.length && comments.length < maxComm; i++) {
+                            const txt = getCleanText(articles[i]);
+                            if (txt.length > 2) comments.push(txt.slice(0, 600));
+                        }
+                        return { main_post: mainPost.slice(0, 2500), comments: comments };
                     }""", max_comments)
                     return {"post_url": post_url, **data}
                 except Exception as e:
@@ -567,9 +568,9 @@ async def lifespan(app: FastAPI):
     await bridge.shutdown()
 
 app = FastAPI(
-    title="Universal Facebook AI Hub (Render Docker Ready)",
+    title="Universal Facebook AI Hub",
     description="API passerelle universelle multi-agents IA.",
-    version="2.8.0",
+    version="2.9.0",
     lifespan=lifespan
 )
 
