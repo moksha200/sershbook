@@ -69,7 +69,7 @@ class VideoAnalyzeRequest(BaseModel):
     video_url: str = Field(..., description="URL de la vidéo Facebook (Reel, Watch, Post) ou externe à analyser par l'IA.")
 
 
-# --- MOTEUR D'AUTOMATISATION MULTI-IA OPTIMISÉ POUR MOBILE ---
+# --- MOTEUR D'AUTOMATISATION MULTI-IA OPTIMISÉ POUR DOCKER ---
 
 class UniversalFacebookBridge:
     def __init__(self):
@@ -115,16 +115,15 @@ class UniversalFacebookBridge:
         await self.shutdown()
         await self._init_db()
 
-        print("[HUB IA] Démarrage à chaud de Chromium (Mode Mobile Low-RAM)...")
+        print("[HUB IA] Démarrage de Chromium dans le conteneur Docker...")
         self.playwright = await async_playwright().start()
 
-        # Correctif DBus strict pour Alwaysdata (format d'adresse valide)
         custom_env = os.environ.copy()
         custom_env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/dev/null"
         custom_env["DISPLAY"] = ""
 
+        # Note : executable_path est omis pour laisser Playwright utiliser le Chromium système de Docker
         self.browser = await self.playwright.chromium.launch(
-            executable_path="/home/sershbook/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome",
             headless=True,
             env=custom_env,
             args=[
@@ -135,7 +134,7 @@ class UniversalFacebookBridge:
                 "--disable-gpu",
                 "--disable-software-rasterizer",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=128",
+                "--js-flags=--max-old-space-size=256",
                 "--blink-settings=imagesEnabled=false",
                 "--no-first-run",
                 "--no-default-browser-check"
@@ -568,9 +567,9 @@ async def lifespan(app: FastAPI):
     await bridge.shutdown()
 
 app = FastAPI(
-    title="Universal Facebook AI Hub",
+    title="Universal Facebook AI Hub (Render Docker Ready)",
     description="API passerelle universelle multi-agents IA.",
-    version="2.6.0",
+    version="2.8.0",
     lifespan=lifespan
 )
 
