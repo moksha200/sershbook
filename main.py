@@ -12,7 +12,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 
@@ -557,7 +557,7 @@ class UniversalFacebookBridge:
 
 # --- INTÉGRATION MCP (MODEL CONTEXT PROTOCOL) ---
 
-mcp_server = FastMCP("Facebook Bridge MCP")
+mcp_server = MCPServer("Facebook Bridge MCP")
 
 @mcp_server.tool()
 async def facebook_search(query: str, category: str = "posts", limit: int = 5) -> str:
