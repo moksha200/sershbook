@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiomysql
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from mcp.server.fastmcp import FastMCP
@@ -783,6 +783,66 @@ async def api_debug():
                 except Exception:
                     pass
     return out
+
+
+@app.get("/inspect", summary="Diagnostic texte de la page (sélecteurs, erreurs, crash)", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
+async def api_inspect(url: str = "https://www.facebook.com/", wait: int = 15):
+    wait = max(3, min(wait, 40))
+    events: List[str] = []
+    async with bridge.lock:
+        page = None
+        try:
+            page = await bridge.get_page()
+            page.on("crash", lambda *_: events.append("PAGE CRASH (mémoire ?)"))
+            page.on("pageerror", lambda e: events.append(f"pageerror: {str(e)[:150]}"))
+            await page.goto(url, wait_until="commit", timeout=30000)
+            await asyncio.sleep(wait)
+            info = await page.evaluate("""() => {
+                const txt = (document.body && document.body.innerText) || "";
+                const n = (sel) => document.querySelectorAll(sel).length;
+                return {
+                    text_len: txt.length,
+                    text_head: txt.replace(/\\s+/g, " ").slice(0, 700),
+                    html_len: document.documentElement.outerHTML.length,
+                    counts: {
+                        article: n('div[role="article"]'),
+                        feed: n('div[role="feed"]'),
+                        main: n('div[role="main"]'),
+                        post_links: n('a[href*="/posts/"]'),
+                        login_form: n('input[name="email"]')
+                    }
+                };
+            }""")
+            return {"final_url": page.url, "title": await page.title(), "events": events[:10], **info}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:300])
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+
+@app.get("/screenshot", summary="Capture d'écran de ce que voit Chromium", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
+async def api_screenshot(url: str = "https://www.facebook.com/", wait: int = 12):
+    wait = max(3, min(wait, 40))
+    async with bridge.lock:
+        page = None
+        try:
+            page = await bridge.get_page()
+            await page.goto(url, wait_until="commit", timeout=30000)
+            await asyncio.sleep(wait)
+            png = await page.screenshot(type="png")
+            return Response(content=png, media_type="image/png", headers={"X-Final-URL": page.url})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:300])
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
 
 @app.post("/reload-cookies", summary="Recharger les cookies depuis MySQL", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
