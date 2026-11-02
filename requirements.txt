@@ -5,4 +5,4 @@ aiomysql
 httpx
 yt-dlp
 pydantic
-mcp
+mcp<2.0.0
