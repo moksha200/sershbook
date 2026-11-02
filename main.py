@@ -39,7 +39,7 @@ USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 )
 ATTEMPTS = int(os.getenv("FB_ATTEMPTS", "2"))
-GOTO_TIMEOUT_MS = int(os.getenv("FB_GOTO_TIMEOUT_MS", "35000"))
+GOTO_TIMEOUT_MS = int(os.getenv("FB_GOTO_TIMEOUT_MS", "45000"))
 LOW_MEMORY = os.getenv("LOW_MEMORY", "1") == "1"
 
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -150,6 +150,7 @@ class UniversalFacebookBridge:
         self.lock = asyncio.Lock()
 
     async def _route_intercept(self, route):
+        # Bloque uniquement les fichiers binaires lourds, laisse le CSS et les XHR pour que React s'hydrate vite
         if route.request.resource_type in ("media", "font", "image"):
             await route.abort()
         else:
@@ -297,7 +298,7 @@ class UniversalFacebookBridge:
         self.playwright = None
         self.context = None
 
-    # --- Outils internes de navigation & extraction ---
+    # --- Navigation résiliente anti-timeout ---
 
     async def _check_authenticated(self, page):
         current = page.url.lower()
@@ -312,16 +313,36 @@ class UniversalFacebookBridge:
                 "Facebook affiche le formulaire de connexion (cookies expirés ou invalides)."
             )
 
+    async def _wait_for_hydration(self, page, max_wait_sec: int = 12):
+        """Attend dynamiquement que React injecte les blocs de texte dans le DOM sans bloquer."""
+        for _ in range(max_wait_sec):
+            try:
+                count = await page.evaluate("""() => {
+                    return document.querySelectorAll('div[dir="auto"], div[role="article"], div[data-ad-preview="message"]').length;
+                }""")
+                if count >= 3:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
     async def _goto(self, page, url: str, wait_selector: Optional[str] = None):
-        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-        await asyncio.sleep(3)
+        """Navigation avec wait_until='commit' et interception des timeouts pour ne jamais crasher."""
+        try:
+            await page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            print(f"[HUB IA] Navigation lente sur {url}, poursuite avec le DOM partiel.")
+
+        await asyncio.sleep(2.5)
         await self._check_authenticated(page)
 
         if wait_selector:
             try:
-                await page.wait_for_selector(wait_selector, timeout=12000)
+                await page.wait_for_selector(wait_selector, timeout=8000)
             except PlaywrightTimeoutError:
-                print(f"[HUB IA] Sélecteur {wait_selector!r} lent sur {url}, poursuite de l'extraction.")
+                pass
+
+        await self._wait_for_hydration(page, max_wait_sec=10)
 
     async def _with_page(self, label: str, action: Callable[[Any], Awaitable[Any]]):
         async with self.lock:
@@ -394,11 +415,8 @@ class UniversalFacebookBridge:
             const cleanString = (str) => {
                 if (!str) return "";
                 return str
-                    // Supprime les caractères invisibles d'obfuscation Facebook (U+034F, zero-width, etc.)
                     .replace(/[\\u034f\\u200b\\u200c\\u200d\\u200e\\u200f\\ufeff]/g, "")
-                    // Supprime les répétitions "FacebookFacebook..." des squelettes de chargement
                     .replace(/(Facebook\\s*){2,}/gi, " ")
-                    // Supprime les chaînes d'horodatage brouillées type "o t r p d s n S e o..."
                     .replace(/\\b([a-zA-Z0-9]\\s+){5,}[a-zA-Z0-9]\\b/g, " ")
                     .replace(/\\s+/g, " ")
                     .trim();
@@ -408,7 +426,6 @@ class UniversalFacebookBridge:
                 if (!node) return "";
                 const clone = node.cloneNode(true);
                 clone.querySelectorAll('script, style, noscript, svg, template, form, nav, header').forEach(s => s.remove());
-                // Ajoute un espace après chaque bloc pour éviter les mots collés ("FollowShared")
                 clone.querySelectorAll('div, p, span, br, li, h1, h2, h3, h4').forEach(el => {
                     el.appendChild(document.createTextNode(" "));
                 });
@@ -439,11 +456,11 @@ class UniversalFacebookBridge:
                 const lower = txt.toLowerCase();
                 if (lower.startsWith("find friends") || lower.startsWith("retrouver des amis")) return true;
                 if (lower.startsWith("create a post") || lower.startsWith("what's on your mind")) return true;
+                if (lower.startsWith("filters") && txt.length < 120) return true;
                 if (lower.includes("unread notifications") && lower.includes("marketplace") && txt.length < 300) return true;
                 return false;
             };
 
-            // Stratégie 1 : Cibler les conteneurs d'articles ou les enfants directs du Feed React
             let candidates = [];
             const roleArticles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-pagelet^="FeedUnit"]'));
             if (roleArticles.length > 0) {
@@ -457,7 +474,6 @@ class UniversalFacebookBridge:
                 }
             }
 
-            // Stratégie 2 : Remonter depuis les en-têtes d'auteurs (h3 / h4) présents dans <div role="main">
             const mainArea = document.querySelector('div[role="main"]') || document.body;
             const authorHeaders = Array.from(mainArea.querySelectorAll('h3, h4'));
             for (const h of authorHeaders) {
@@ -471,7 +487,6 @@ class UniversalFacebookBridge:
                 }
             }
 
-            // Stratégie 3 : Cibler directement les messages de posts (div[data-ad-preview="message"] ou div[dir="auto"])
             const msgBlocks = Array.from(mainArea.querySelectorAll('div[data-ad-preview="message"], div[dir="auto"]'));
             for (const mb of msgBlocks) {
                 const msgTxt = cleanString(mb.textContent || "");
@@ -492,14 +507,12 @@ class UniversalFacebookBridge:
                 if (results.length >= maxItems) break;
                 if (!el) continue;
 
-                // Priorité aux blocs dir="auto" internes pour avoir le texte pur du post sans les menus
                 const dirAutos = Array.from(el.querySelectorAll('div[data-ad-preview="message"], div[dir="auto"]'))
                     .map(n => getCleanText(n))
                     .filter(t => t.length >= 20 && !isNoiseUI(t));
 
                 let postContent = "";
                 if (dirAutos.length > 0) {
-                    // Déduplique les sous-blocs identiques
                     const uniqueParts = [];
                     for (const part of dirAutos) {
                         if (!uniqueParts.some(u => u.includes(part) || part.includes(u))) {
@@ -511,7 +524,6 @@ class UniversalFacebookBridge:
                     postContent = getCleanText(el);
                 }
 
-                // Nettoyage des préfixes UI éventuels si le conteneur était trop large
                 postContent = postContent
                     .replace(/^.*?Share a photo, video or write something\\s*(Feed posts)?\\s*/i, "")
                     .replace(/See translation.*$/i, "")
@@ -530,7 +542,6 @@ class UniversalFacebookBridge:
                 if (isDup) continue;
                 seenSignatures.add(sig);
 
-                // Extraction de l'auteur
                 let author = "Publication Facebook";
                 const heading = el.querySelector('h2, h3, h4, strong, a[role="link"] span');
                 if (heading) {
@@ -561,9 +572,9 @@ class UniversalFacebookBridge:
 
         async def action(page):
             await self._goto(page, target_url, wait_selector='div[role="main"]')
-            for _ in range(4):
-                await page.evaluate("window.scrollBy(0, 1200)")
-                await asyncio.sleep(1.8)
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, 1300)")
+                await asyncio.sleep(1.5)
 
             return await self._extract_dom_posts(page, limit)
 
@@ -571,13 +582,10 @@ class UniversalFacebookBridge:
 
     async def get_feed(self, limit: int = 5) -> List[Dict[str, Any]]:
         async def action(page):
-            # sk=h_chr force le fil chronologique ("Plus récents"), beaucoup plus riche en vrais posts
             await self._goto(page, "https://www.facebook.com/?sk=h_chr", wait_selector='div[role="main"]')
-            await asyncio.sleep(2)
-
-            for _ in range(4):
+            for _ in range(3):
                 await page.evaluate("window.scrollBy(0, 1400)")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1.8)
 
             return await self._extract_dom_posts(page, limit)
 
@@ -714,7 +722,7 @@ class UniversalFacebookBridge:
     async def read_post_and_comments(self, post_url: str, max_comments: int = 10) -> Dict[str, Any]:
         async def action(page):
             await self._goto(page, post_url, wait_selector='div[role="main"]')
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
             data = await page.evaluate("""(maxComm) => {
                 const clean = (s) => (s || "")
@@ -868,7 +876,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Universal Facebook AI Hub",
     description="API passerelle universelle multi-agents IA (Gemini, Claude, ChatGPT) avec support REST et MCP SSE.",
-    version="3.3.0",
+    version="3.4.0",
     lifespan=lifespan,
 )
 
