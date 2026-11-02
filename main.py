@@ -4,14 +4,13 @@ import hmac
 import json
 import os
 import tempfile
-import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiomysql
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, Security
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from mcp.server.fastmcp import FastMCP
@@ -432,22 +431,27 @@ class UniversalFacebookBridge:
                 return cleanString(clone.textContent || "");
             };
 
+            const PERMALINK_HINTS = [
+                '/posts/', '/videos/', '/reel/', '/permalink/',
+                '/share/p/', '/share/v/', '/share/r/',
+                'story_fbid=', 'pfbid', '/photo'
+            ];
+
             const extractPermalink = (container) => {
-                if (!container) return null;
-                const links = Array.from(container.querySelectorAll('a[href]'));
-                for (const a of links) {
-                    const href = a.href || "";
-                    if (
-                        href.includes('/posts/') ||
-                        href.includes('/videos/') ||
-                        href.includes('/reel/') ||
-                        href.includes('story_fbid=') ||
-                        href.includes('/permalink/') ||
-                        href.includes('/photo')
-                    ) {
-                        if (href.includes('story_fbid=')) return href;
-                        return href.split('?')[0];
+                let node = container;
+                for (let depth = 0; node && depth < 10; depth++) {
+                    const links = Array.from(node.querySelectorAll('a[href]'));
+                    for (const a of links) {
+                        const href = a.href || "";
+                        if (PERMALINK_HINTS.some(h => href.includes(h))) {
+                            return href.includes('story_fbid=') ? href : href.split('?')[0];
+                        }
                     }
+                    node = node.parentElement;
+                    if (!node) break;
+                    const role = node.getAttribute('role');
+                    if (role === 'feed' || role === 'main') break;
+                    if (node.querySelectorAll('div[data-ad-preview="message"]').length > 1) break;
                 }
                 return null;
             };
@@ -543,11 +547,14 @@ class UniversalFacebookBridge:
                 seenSignatures.add(sig);
 
                 let author = "Publication Facebook";
-                const heading = el.querySelector('h2, h3, h4, strong, a[role="link"] span');
-                if (heading) {
+                const headings = Array.from(el.querySelectorAll('h2, h3, h4, strong, a[role="link"] span'));
+                for (const heading of headings) {
                     const hText = getCleanText(heading).replace(/\\s*·\\s*(Follow|Suivre).*$/i, "").trim();
-                    if (hText && hText.length > 1 && hText.length < 75 && !hText.toLowerCase().includes("notifications")) {
+                    if (hText && hText.length > 1 && hText.length < 75
+                        && !hText.toLowerCase().includes("notifications")
+                        && !/status indicator|online|active now|en ligne/i.test(hText)) {
                         author = hText;
+                        break;
                     }
                 }
 
@@ -841,26 +848,45 @@ async def facebook_analyze_video(video_url: str) -> str:
 
 
 class MCPAuthMiddleware:
-    PROTECTED_PREFIXES = ("/sse", "/messages")
+    """
+    /sse      : clé acceptée via header (Authorization / X-API-Key) OU via ?key=...
+                (Claude.ai ne peut pas envoyer de header sur un connecteur custom).
+    /messages : exige un session_id (UUID aléatoire obtenu uniquement via /sse authentifié).
+    """
 
     def __init__(self, app):
         self.app = app
 
+    async def _deny(self, send):
+        body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith(self.PROTECTED_PREFIXES):
-            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-            if not _token_is_valid(headers.get("authorization"), headers.get("x-api-key")):
-                body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
-                await send({
-                    "type": "http.response.start",
-                    "status": 403,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                })
-                await send({"type": "http.response.body", "body": body})
-                return
+        if scope["type"] == "http":
+            path = scope["path"]
+            qs = urllib.parse.parse_qs(scope.get("query_string", b"").decode())
+
+            if path.startswith("/sse"):
+                headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+                key = (qs.get("key") or [None])[0]
+                ok = _token_is_valid(headers.get("authorization"), headers.get("x-api-key"))
+                if not ok and key:
+                    ok = hmac.compare_digest(key.encode(), API_KEY.encode())
+                if not ok:
+                    return await self._deny(send)
+
+            elif path.startswith("/messages"):
+                if not qs.get("session_id"):
+                    return await self._deny(send)
+
         await self.app(scope, receive, send)
 
 
@@ -876,7 +902,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Universal Facebook AI Hub",
     description="API passerelle universelle multi-agents IA (Gemini, Claude, ChatGPT) avec support REST et MCP SSE.",
-    version="3.4.0",
+    version="3.5.0",
     lifespan=lifespan,
 )
 
