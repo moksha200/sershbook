@@ -12,6 +12,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
+from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 
@@ -237,7 +238,6 @@ class UniversalFacebookBridge:
             raise RuntimeError(f"Échec préparation média : {e}")
 
     async def _extract_dom_posts(self, page, limit: int) -> List[Dict[str, Any]]:
-        """Extrait le texte propre en ignorant totalement les balises <script> et <style>."""
         return await page.evaluate("""(maxItems) => {
             const getCleanText = (node) => {
                 const clone = node.cloneNode(true);
@@ -282,8 +282,6 @@ class UniversalFacebookBridge:
             }
             return results;
         }""", limit)
-
-    # --- FONCTIONS MÉTIERS ---
 
     async def search(self, query: str, category: str = "posts", limit: int = 5) -> List[Dict[str, Any]]:
         async with self.lock:
@@ -557,7 +555,48 @@ class UniversalFacebookBridge:
         return metadata
 
 
-# --- INITIALISATION FASTAPI ---
+# --- INTÉGRATION MCP (MODEL CONTEXT PROTOCOL) ---
+
+mcp_server = FastMCP("Facebook Bridge MCP")
+
+@mcp_server.tool()
+async def facebook_search(query: str, category: str = "posts", limit: int = 5) -> str:
+    """Recherche des publications sur Facebook par mots-clés."""
+    res = await bridge.search(query=query, category=category, limit=limit)
+    return json.dumps(res, ensure_ascii=False)
+
+@mcp_server.tool()
+async def facebook_publish(content: str, media_url: Optional[str] = None) -> str:
+    """Publie un message texte ou un média sur Facebook."""
+    res = await bridge.publish(content=content, media_url=media_url)
+    return json.dumps(res, ensure_ascii=False)
+
+@mcp_server.tool()
+async def facebook_comment(post_url: str, comment_text: str) -> str:
+    """Publie un commentaire sous un post ou une vidéo Facebook."""
+    res = await bridge.comment_post(post_url=post_url, comment_text=comment_text)
+    return json.dumps(res, ensure_ascii=False)
+
+@mcp_server.tool()
+async def facebook_like(post_url: str) -> str:
+    """Aime (Like) une publication Facebook spécifiée."""
+    res = await bridge.like_post(post_url=post_url)
+    return json.dumps(res, ensure_ascii=False)
+
+@mcp_server.tool()
+async def facebook_read_post(post_url: str, max_comments: int = 10) -> str:
+    """Lit le contenu d'un post et extrait ses commentaires."""
+    res = await bridge.read_post_and_comments(post_url=post_url, max_comments=max_comments)
+    return json.dumps(res, ensure_ascii=False)
+
+@mcp_server.tool()
+async def facebook_analyze_video(video_url: str) -> str:
+    """Analyse les métadonnées et le contenu d'une vidéo Facebook."""
+    res = await bridge.analyze_video(video_url=video_url)
+    return json.dumps(res, ensure_ascii=False)
+
+
+# --- INITIALISATION FASTAPI & LIFESPAN ---
 
 bridge = UniversalFacebookBridge()
 
@@ -569,8 +608,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Universal Facebook AI Hub",
-    description="API passerelle universelle multi-agents IA.",
-    version="2.9.0",
+    description="API passerelle universelle multi-agents IA avec support REST et MCP SSE.",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -597,7 +636,7 @@ async def verify_universal_auth(
     return token
 
 
-# --- ROUTES EXPOSÉES ---
+# --- ROUTES REST EXPOSÉES ---
 
 @app.get("/health", summary="Vérifier l'état du hub", tags=["Système"])
 async def api_health():
@@ -694,3 +733,6 @@ async def api_ai_manifest(request: Request):
             {"name": "facebook_analyze_video", "endpoint": f"{base_url}/analyze-video", "method": "POST", "parameters": VideoAnalyzeRequest.model_json_schema()}
         ]
     }
+
+# Montage de l'application SSE de FastMCP sur FastAPI
+app.mount("/sse", mcp_server.sse_app())
