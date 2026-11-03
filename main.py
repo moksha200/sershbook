@@ -3,10 +3,12 @@ import base64
 import hmac
 import json
 import os
+import re
 import tempfile
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiomysql
@@ -42,6 +44,8 @@ ATTEMPTS = int(os.getenv("FB_ATTEMPTS", "2"))
 GOTO_TIMEOUT_MS = int(os.getenv("FB_GOTO_TIMEOUT_MS", "30000"))
 # Mettre LOW_MEMORY=0 sur une instance avec plus de 1 Go de RAM
 LOW_MEMORY = os.getenv("LOW_MEMORY", "1") == "1"
+MAX_SCROLLS = int(os.getenv("FB_MAX_SCROLLS", "6"))
+POST_WAIT_SELECTOR = '[data-ad-rendering-role="story_message"], [aria-posinset]'
 
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
 x_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -134,6 +138,111 @@ def _normalize_cookies(raw: Any) -> List[Dict[str, Any]]:
             c.pop("expires", None)
         cookies.append(c)
     return cookies
+
+
+# --- EXTRACTION DEPUIS LES DONNÉES JSON DE FACEBOOK (texte propre, vrais liens) ---
+
+PRUNE_FOR_TEXT = {
+    "feedback", "comment_list_renderer", "comments", "top_level_comments",
+    "comment_rendering_instance", "attached_story", "reshare_attribution",
+}
+PERMALINK_HINTS = ("/posts/", "pfbid", "/videos/", "/reel/", "/permalink", "story_fbid")
+
+
+def _iter_dicts(obj: Any):
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+def _find_message_text(d: Any, depth: int = 0) -> Optional[str]:
+    if depth > 14:
+        return None
+    if isinstance(d, dict):
+        msg = d.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("text"), str) and msg["text"].strip():
+            return msg["text"]
+        for k, v in d.items():
+            if k in PRUNE_FOR_TEXT:
+                continue
+            found = _find_message_text(v, depth + 1)
+            if found:
+                return found
+    elif isinstance(d, list):
+        for v in d:
+            found = _find_message_text(v, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _find_permalink(d: Any, depth: int = 0) -> Optional[str]:
+    if depth > 14:
+        return None
+    if isinstance(d, dict):
+        for key in ("permalink_url", "wwwURL", "url"):
+            u = d.get(key)
+            if isinstance(u, str) and u.startswith("http") and any(h in u for h in PERMALINK_HINTS):
+                return u
+        for v in d.values():
+            r = _find_permalink(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(d, list):
+        for v in d:
+            r = _find_permalink(v, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def _find_author(d: Dict[str, Any]) -> Optional[str]:
+    fb = d.get("feedback")
+    if isinstance(fb, dict):
+        op = fb.get("owning_profile")
+        if isinstance(op, dict) and op.get("name"):
+            return op["name"]
+    for x in _iter_dicts(d):
+        actors = x.get("actors")
+        if isinstance(actors, list) and actors and isinstance(actors[0], dict) and actors[0].get("name"):
+            return actors[0]["name"]
+    return None
+
+
+def _story_to_item(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    text = _find_message_text(d)
+    post_id = d.get("post_id") or d.get("id")
+    if not text or not post_id:
+        return None
+    link = _find_permalink(d)
+    if not link and d.get("post_id"):
+        link = f"https://www.facebook.com/{d['post_id']}"
+    created = d.get("creation_time")
+    created_iso = None
+    if isinstance(created, (int, float)):
+        created_iso = datetime.fromtimestamp(created, timezone.utc).isoformat()
+    return {
+        "post_id": str(d.get("post_id") or ""),
+        "author": _find_author(d) or "Auteur Facebook",
+        "post_url": link,
+        "created_at": created_iso,
+        "content": re.sub(r"\s+", " ", text).strip()[:1500],
+    }
+
+
+def collect_stories(obj: Any, out: Dict[str, Dict[str, Any]]) -> None:
+    for d in _iter_dicts(obj):
+        if d.get("__typename") == "Story" and (d.get("post_id") or d.get("id")):
+            item = _story_to_item(d)
+            if item:
+                key = item["post_id"] or item["content"][:80]
+                if key not in out or len(item["content"]) > len(out[key]["content"]):
+                    out[key] = item
 
 
 # --- MOTEUR D'AUTOMATISATION ---
@@ -375,47 +484,125 @@ class UniversalFacebookBridge:
 
     async def _extract_dom_posts(self, page, limit: int) -> List[Dict[str, Any]]:
         return await page.evaluate("""(maxItems) => {
-            const getCleanText = (node) => {
+            const clean = (node) => {
                 const raw = node.innerText || node.textContent || "";
                 return raw.replace(/[\\u034f\\u200b-\\u200f\\u2060\\ufeff]/g, "").replace(/\\s+/g, " ").trim();
             };
-
-            const articles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-story-id]'));
-            const results = [];
-            const seenTexts = new Set();
-
-            for (const el of articles) {
-                if (results.length >= maxItems) break;
-
-                const rawText = getCleanText(el);
-                if (rawText.replace(/Facebook/g, "").trim().length < 15 || seenTexts.has(rawText.slice(0, 100))) continue;
-                seenTexts.add(rawText.slice(0, 100));
-
-                let postUrl = null;
+            const urlOf = (el) => {
+                if (!el) return null;
                 const links = Array.from(el.querySelectorAll('a[href]'));
                 for (const a of links) {
                     const href = a.href;
-                    if (href.includes('/posts/') || href.includes('/videos/') || href.includes('/reel/') || href.includes('story_fbid=') || href.includes('/permalink/')) {
-                        postUrl = href.split('?')[0];
-                        if (href.includes('story_fbid=')) postUrl = href;
-                        break;
+                    if (href.includes('/posts/') || href.includes('/videos/') || href.includes('/reel/') || href.includes('story_fbid=') || href.includes('/permalink/') || href.includes('pfbid')) {
+                        return href.includes('story_fbid=') ? href : href.split('?')[0];
                     }
                 }
+                return null;
+            };
+            const authorOf = (el) => {
+                if (!el) return "Auteur Facebook";
+                const h = el.querySelector('[data-ad-rendering-role="profile_name"], h2, h3, h4, strong');
+                const t = h ? clean(h) : "";
+                return t || "Auteur Facebook";
+            };
+            const results = [];
+            const seen = new Set();
+            const add = (author, postUrl, content) => {
+                if (results.length >= maxItems) return;
+                const stripped = content.replace(/Facebook/g, "").trim();
+                if (stripped.length < 15) return;
+                const key = content.slice(0, 100);
+                if (seen.has(key)) return;
+                seen.add(key);
+                results.push({ author: author, post_url: postUrl, content: content.slice(0, 1500) });
+            };
 
-                let author = "Auteur Facebook";
-                const heading = el.querySelector('h3, h4, strong, a');
-                if (heading) {
-                    author = getCleanText(heading);
+            // Stratégie A : blocs de message de post
+            const msgs = Array.from(document.querySelectorAll('[data-ad-rendering-role="story_message"], [data-ad-comet-preview="message"], [data-ad-preview="message"]'));
+            for (const msg of msgs) {
+                let box = msg.closest('[role="article"], [aria-posinset], [data-pagelet^="FeedUnit"]');
+                if (!box) {
+                    box = msg;
+                    for (let i = 0; i < 6 && box.parentElement; i++) box = box.parentElement;
                 }
+                add(authorOf(box), urlOf(box), clean(msg));
+            }
 
-                results.push({
-                    author: author,
-                    post_url: postUrl,
-                    content: rawText.slice(0, 1500)
-                });
+            // Stratégie B : conteneurs d'articles (anciens sélecteurs)
+            if (results.length < maxItems) {
+                const boxes = Array.from(document.querySelectorAll('div[role="article"], article, div[data-story-id], [aria-posinset], [data-pagelet^="FeedUnit"]'));
+                for (const box of boxes) add(authorOf(box), urlOf(box), clean(box));
             }
             return results;
         }""", limit)
+
+    # --- Collecte des posts : JSON embarqué + réponses GraphQL + DOM en secours ---
+
+    def _attach_story_collector(self, page, stories: Dict[str, Dict[str, Any]]) -> List[asyncio.Task]:
+        tasks: List[asyncio.Task] = []
+
+        async def handle(resp):
+            try:
+                if "/api/graphql" not in resp.url:
+                    return
+                body = await resp.text()
+                for line in body.splitlines():
+                    line = line.strip()
+                    if not line or '"Story"' not in line:
+                        continue
+                    try:
+                        collect_stories(json.loads(line), stories)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        page.on("response", lambda r: tasks.append(asyncio.create_task(handle(r))))
+        return tasks
+
+    async def _collect_embedded(self, page, stories: Dict[str, Dict[str, Any]]):
+        try:
+            blocks = await page.evaluate("""() => Array.from(document.querySelectorAll('script[type="application/json"]'))
+                .map(s => s.textContent)
+                .filter(t => t && t.includes('"Story"'))""")
+        except Exception:
+            return
+        for b in blocks:
+            try:
+                collect_stories(json.loads(b), stories)
+            except Exception:
+                continue
+
+    async def _collect_posts(self, page, url: str, limit: int) -> List[Dict[str, Any]]:
+        stories: Dict[str, Dict[str, Any]] = {}
+        tasks = self._attach_story_collector(page, stories)
+
+        await self._goto(page, url, wait_selector=POST_WAIT_SELECTOR)
+        await self._collect_embedded(page, stories)
+
+        for _ in range(MAX_SCROLLS):
+            if len(stories) >= limit:
+                break
+            await page.evaluate("window.scrollBy(0, 1400)")
+            await asyncio.sleep(2.5)
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._collect_embedded(page, stories)
+
+        items = list(stories.values())
+        if len(items) < limit:
+            try:
+                dom_posts = await self._extract_dom_posts(page, limit)
+            except Exception:
+                dom_posts = []
+            known = {i["content"][:60] for i in items}
+            for p in dom_posts:
+                if len(items) >= limit:
+                    break
+                if p["content"][:60] not in known:
+                    items.append(p)
+        return items[:limit]
 
     # --- Actions Facebook ---
 
@@ -424,29 +611,21 @@ class UniversalFacebookBridge:
         target_url = f"https://www.facebook.com/search/{path}/?q={urllib.parse.quote(query)}"
 
         async def action(page):
-            await self._goto(page, target_url, wait_selector='div[role="article"]')
-            await page.evaluate("window.scrollBy(0, 1000)")
-            await asyncio.sleep(2)
-
-            posts = await self._extract_dom_posts(page, limit)
-            if not posts:
+            items = await self._collect_posts(page, target_url, limit)
+            if not items:
                 fallback_text = await page.evaluate("""() => {
-                    const clone = document.body.cloneNode(true);
-                    clone.querySelectorAll('script, style, noscript, svg').forEach(s => s.remove());
-                    return (clone.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 2000);
+                    const raw = (document.body && document.body.innerText) || "";
+                    return raw.replace(/[\\u034f\\u200b-\\u200f\\u2060\\ufeff]/g, "").replace(/Facebook/g, "").replace(/\\s+/g, " ").trim().slice(0, 3000);
                 }""")
                 if fallback_text:
-                    posts = [{"author": "Résultat extrait", "post_url": target_url, "content": fallback_text}]
-            return posts
+                    items = [{"author": "Résultat extrait", "post_url": target_url, "content": fallback_text}]
+            return items
 
         return await self._with_page("SEARCH", action)
 
     async def get_feed(self, limit: int = 5) -> List[Dict[str, Any]]:
         async def action(page):
-            await self._goto(page, "https://www.facebook.com/", wait_selector='div[role="article"]')
-            await page.evaluate("window.scrollBy(0, 1200)")
-            await asyncio.sleep(2)
-            return await self._extract_dom_posts(page, limit)
+            return await self._collect_posts(page, "https://www.facebook.com/", limit)
 
         return await self._with_page("FEED", action)
 
@@ -807,7 +986,11 @@ async def api_inspect(url: str = "https://www.facebook.com/", wait: int = 15):
                         feed: n('div[role="feed"]'),
                         main: n('div[role="main"]'),
                         post_links: n('a[href*="/posts/"]'),
-                        login_form: n('input[name="email"]')
+                        login_form: n('input[name="email"]'),
+                        story_message: n('[data-ad-rendering-role="story_message"], [data-ad-comet-preview="message"], [data-ad-preview="message"]'),
+                        profile_name: n('[data-ad-rendering-role="profile_name"]'),
+                        posinset: n('[aria-posinset]'),
+                        pfbid_links: n('a[href*="pfbid"]')
                     }
                 };
             }""")
