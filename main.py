@@ -860,28 +860,68 @@ async def facebook_analyze_video(video_url: str) -> str:
 
 class MCPAuthMiddleware:
     """Protège les chemins MCP (/sse et /messages) avec la même clé API que le REST.
+
+    Accepte la clé dans les headers (Authorization / X-API-Key) OU dans l'URL (?key=...),
+    car beaucoup de connecteurs MCP (dont Claude.ai) ne savent pas envoyer de headers.
+    Pour /messages, le client ne renvoie pas ?key= : on accepte alors le session_id
+    émis par une connexion /sse déjà authentifiée (identifiant aléatoire non devinable).
     Middleware ASGI pur pour ne pas casser le streaming SSE."""
 
     PROTECTED_PREFIXES = ("/sse", "/messages")
+    MAX_SESSIONS = 500
+    SESSION_RE = re.compile(rb"session_id=([0-9a-fA-F]{16,64})")
 
     def __init__(self, app):
         self.app = app
+        self.sessions: Dict[str, bool] = {}
+
+    def _remember_session(self, session_id: str):
+        self.sessions[session_id] = True
+        while len(self.sessions) > self.MAX_SESSIONS:
+            self.sessions.pop(next(iter(self.sessions)))
+
+    async def _deny(self, send):
+        body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith(self.PROTECTED_PREFIXES):
-            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-            if not _token_is_valid(headers.get("authorization"), headers.get("x-api-key")):
-                body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
-                await send({
-                    "type": "http.response.start",
-                    "status": 403,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                })
-                await send({"type": "http.response.body", "body": body})
-                return
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not path.startswith(self.PROTECTED_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        query = urllib.parse.parse_qs(scope.get("query_string", b"").decode(errors="ignore"))
+        url_key = (query.get("key") or query.get("api_key") or [None])[0]
+        session_id = (query.get("session_id") or [None])[0]
+
+        authorized = (
+            _token_is_valid(headers.get("authorization"), headers.get("x-api-key"))
+            or (url_key is not None and _token_is_valid(None, url_key))
+            or (path.startswith("/messages") and session_id in self.sessions)
+        )
+        if not authorized:
+            await self._deny(send)
+            return
+
+        if path.startswith("/sse"):
+            async def capturing_send(message):
+                if message["type"] == "http.response.body":
+                    for m in self.SESSION_RE.finditer(message.get("body", b"") or b""):
+                        self._remember_session(m.group(1).decode())
+                await send(message)
+
+            await self.app(scope, receive, capturing_send)
+            return
+
         await self.app(scope, receive, send)
 
 
