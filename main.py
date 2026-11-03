@@ -509,6 +509,7 @@ class UniversalFacebookBridge:
             const seen = new Set();
             const add = (author, postUrl, content) => {
                 if (results.length >= maxItems) return;
+                content = content.replace(/(?:Facebook\\s*){2,}/g, " ").replace(/\\s+/g, " ").trim();
                 const stripped = content.replace(/Facebook/g, "").trim();
                 if (stripped.length < 15) return;
                 const key = content.slice(0, 100);
@@ -591,7 +592,7 @@ class UniversalFacebookBridge:
         await self._collect_embedded(page, stories)
 
         items = list(stories.values())
-        if len(items) < limit:
+        if not items:
             try:
                 dom_posts = await self._extract_dom_posts(page, limit)
             except Exception:
