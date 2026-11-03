@@ -1,0 +1,63 @@
+{
+  "description": "Configurations MCP prêtes à copier-coller pour Claude Desktop, Claude CLI et Gemini CLI / Antigravity.",
+  "claude_desktop_config.json": {
+    "mcpServers": {
+      "sershbook-local-engine": {
+        "command": "/home/phantom/facebook/venv/bin/python",
+        "args": [
+          "/home/phantom/facebook/index.py",
+          "--stdio"
+        ],
+        "env": {
+          "FB_BRIDGE_API_KEY": "sershell_secret_token_2026",
+          "DB_HOST": "mysql-sershbook.alwaysdata.net",
+          "DB_USER": "sershbook",
+          "DB_PASS": "azertyuiop1234567890@/",
+          "DB_NAME": "sershbook_db",
+          "DB_PORT": "3306",
+          "LOW_MEMORY": "1"
+        }
+      },
+      "sershbook-remote-bridge": {
+        "command": "/home/phantom/facebook/venv/bin/python",
+        "args": [
+          "/home/phantom/facebook/mcp_stdio_bridge.py"
+        ],
+        "env": {
+          "SERSHBOOK_MODE": "remote",
+          "SERSHBOOK_API_URL": "https://sershbook.onrender.com",
+          "FB_BRIDGE_API_KEY": "sershell_secret_token_2026"
+        }
+      }
+    }
+  },
+  "gemini_cli_settings.json": {
+    "mcpServers": {
+      "sershbook": {
+        "command": "/home/phantom/facebook/venv/bin/python",
+        "args": [
+          "/home/phantom/facebook/mcp_stdio_bridge.py"
+        ],
+        "env": {
+          "SERSHBOOK_MODE": "local",
+          "SERSHBOOK_API_URL": "http://127.0.0.1:8090",
+          "FB_BRIDGE_API_KEY": "sershell_secret_token_2026"
+        }
+      },
+      "sershbook-sse": {
+        "url": "http://127.0.0.1:8090/sse?key=sershell_secret_token_2026",
+        "headers": {
+          "Authorization": "Bearer sershell_secret_token_2026",
+          "X-API-Key": "sershell_secret_token_2026"
+        }
+      },
+      "sershbook-render-sse": {
+        "url": "https://sershbook.onrender.com/sse?key=sershell_secret_token_2026",
+        "headers": {
+          "Authorization": "Bearer sershell_secret_token_2026",
+          "X-API-Key": "sershell_secret_token_2026"
+        }
+      }
+    }
+  }
+}
