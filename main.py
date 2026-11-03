@@ -306,6 +306,7 @@ class UniversalFacebookBridge:
         if wait_selector:
             try:
                 await page.wait_for_selector(wait_selector, timeout=15000)
+                await asyncio.sleep(5)
             except PlaywrightTimeoutError:
                 print(f"[HUB IA] Sélecteur {wait_selector!r} non apparu, on continue.")
 
@@ -375,10 +376,8 @@ class UniversalFacebookBridge:
     async def _extract_dom_posts(self, page, limit: int) -> List[Dict[str, Any]]:
         return await page.evaluate("""(maxItems) => {
             const getCleanText = (node) => {
-                const clone = node.cloneNode(true);
-                const scriptNodes = clone.querySelectorAll('script, style, noscript, svg, template');
-                scriptNodes.forEach(s => s.remove());
-                return (clone.textContent || "").replace(/\\s+/g, " ").trim();
+                const raw = node.innerText || node.textContent || "";
+                return raw.replace(/[\\u034f\\u200b-\\u200f\\u2060\\ufeff]/g, "").replace(/\\s+/g, " ").trim();
             };
 
             const articles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-story-id]'));
@@ -389,7 +388,7 @@ class UniversalFacebookBridge:
                 if (results.length >= maxItems) break;
 
                 const rawText = getCleanText(el);
-                if (rawText.length < 15 || seenTexts.has(rawText.slice(0, 100))) continue;
+                if (rawText.replace(/Facebook/g, "").trim().length < 15 || seenTexts.has(rawText.slice(0, 100))) continue;
                 seenTexts.add(rawText.slice(0, 100));
 
                 let postUrl = null;
@@ -570,9 +569,8 @@ class UniversalFacebookBridge:
 
             data = await page.evaluate("""(maxComm) => {
                 const getCleanText = (node) => {
-                    const clone = node.cloneNode(true);
-                    clone.querySelectorAll('script, style, noscript, svg, template').forEach(s => s.remove());
-                    return (clone.textContent || "").replace(/\\s+/g, " ").trim();
+                    const raw = node.innerText || node.textContent || "";
+                    return raw.replace(/[\\u034f\\u200b-\\u200f\\u2060\\ufeff]/g, "").replace(/\\s+/g, " ").trim();
                 };
                 const articles = Array.from(document.querySelectorAll('div[role="article"]'));
                 const mainPost = articles.length > 0 ? getCleanText(articles[0]) : "";
