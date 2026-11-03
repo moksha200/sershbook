@@ -4,13 +4,14 @@ import hmac
 import json
 import os
 import tempfile
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiomysql
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from mcp.server.fastmcp import FastMCP
@@ -19,7 +20,7 @@ from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (tout vient des variables d'environnement Render) ---
 
 API_KEY = os.getenv("FB_BRIDGE_API_KEY", "sershell_secret_token_2026")
 
@@ -35,10 +36,11 @@ DB_CONFIG = {
 USER_AGENT = os.getenv(
     "FB_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 ATTEMPTS = int(os.getenv("FB_ATTEMPTS", "2"))
-GOTO_TIMEOUT_MS = int(os.getenv("FB_GOTO_TIMEOUT_MS", "45000"))
+GOTO_TIMEOUT_MS = int(os.getenv("FB_GOTO_TIMEOUT_MS", "30000"))
+# Mettre LOW_MEMORY=0 sur une instance avec plus de 1 Go de RAM
 LOW_MEMORY = os.getenv("LOW_MEMORY", "1") == "1"
 
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -64,34 +66,34 @@ class SearchRequest(BaseModel):
     query: str = Field(..., description="Mots-clés exacts à rechercher sur Facebook.")
     category: str = Field(
         default="posts",
-        description="Catégorie : 'top' (populaire), 'posts' (publications), 'videos' (vidéos), 'pages' (pages), 'people' (personnes).",
+        description="Catégorie : 'posts' (publications), 'videos' (vidéos), 'pages' (pages), 'people' (personnes).",
     )
     limit: int = Field(default=5, ge=1, le=15, description="Nombre de résultats (1 à 15).")
 
 
 class PublishRequest(BaseModel):
     content: str = Field(..., description="Texte complet de la publication.")
-    media_url: Optional[str] = Field(default=None, description="URL directe (HTTP/HTTPS) d'une photo ou vidéo.")
-    media_base64: Optional[str] = Field(default=None, description="Fichier média encodé en Base64.")
-    media_filename: Optional[str] = Field(default="media.mp4", description="Nom du fichier (ex: image.jpg, video.mp4).")
+    media_url: Optional[str] = Field(default=None)
+    media_base64: Optional[str] = Field(default=None)
+    media_filename: Optional[str] = Field(default="media.mp4")
 
 
 class CommentRequest(BaseModel):
-    post_url: str = Field(..., description="URL directe du post Facebook.")
-    comment_text: str = Field(..., description="Texte du commentaire à publier.")
+    post_url: str = Field(...)
+    comment_text: str = Field(...)
 
 
 class LikeRequest(BaseModel):
-    post_url: str = Field(..., description="URL directe du post Facebook à liker.")
+    post_url: str = Field(...)
 
 
 class ReadPostRequest(BaseModel):
-    post_url: str = Field(..., description="URL directe du post Facebook à lire.")
-    max_comments: int = Field(default=10, ge=1, le=30, description="Nombre maximum de commentaires à extraire.")
+    post_url: str = Field(...)
+    max_comments: int = Field(default=10, ge=1, le=30)
 
 
 class VideoAnalyzeRequest(BaseModel):
-    video_url: str = Field(..., description="URL de la vidéo Facebook à analyser.")
+    video_url: str = Field(...)
 
 
 class FacebookAuthError(RuntimeError):
@@ -99,7 +101,6 @@ class FacebookAuthError(RuntimeError):
 
 
 SEARCH_PATHS = {
-    "top": "top",
     "posts": "posts",
     "videos": "videos",
     "pages": "pages",
@@ -116,6 +117,7 @@ SAMESITE_MAP = {
 
 
 def _normalize_cookies(raw: Any) -> List[Dict[str, Any]]:
+    """Rend les cookies exportés d'un navigateur compatibles avec Playwright."""
     cookies = []
     for c in raw:
         c = dict(c)
@@ -130,10 +132,6 @@ def _normalize_cookies(raw: Any) -> List[Dict[str, Any]]:
             c.pop(junk, None)
         if c.get("expires") in (None, 0, -1):
             c.pop("expires", None)
-        if "domain" not in c or not c["domain"]:
-            c["domain"] = ".facebook.com"
-        if "path" not in c or not c["path"]:
-            c["path"] = "/"
         cookies.append(c)
     return cookies
 
@@ -149,7 +147,6 @@ class UniversalFacebookBridge:
         self.lock = asyncio.Lock()
 
     async def _route_intercept(self, route):
-        # Bloque uniquement les fichiers binaires lourds, laisse le CSS et les XHR pour que React s'hydrate vite
         if route.request.resource_type in ("media", "font", "image"):
             await route.abort()
         else:
@@ -207,16 +204,13 @@ class UniversalFacebookBridge:
         if LOW_MEMORY:
             args += ["--renderer-process-limit=1", "--js-flags=--max-old-space-size=256"]
 
-        alwaysdata_chrome = "/home/sershbook/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome"
-        launch_kwargs: Dict[str, Any] = {"headless": True, "env": custom_env, "args": args}
-        if os.path.exists(alwaysdata_chrome):
-            launch_kwargs["executable_path"] = alwaysdata_chrome
-
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+        self.browser = await self.playwright.chromium.launch(
+            headless=True, env=custom_env, args=args
+        )
 
         self.context = await self.browser.new_context(
             user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1280, "height": 720},
             locale="fr-FR",
         )
 
@@ -234,11 +228,9 @@ class UniversalFacebookBridge:
             page = await self.context.new_page()
 
         await page.route("**/*", self._route_intercept)
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.navigator.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr', 'en-US', 'en'] });
-        """)
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
         return page
 
     async def _reload_cookies_from_db(self) -> int:
@@ -297,53 +289,28 @@ class UniversalFacebookBridge:
         self.playwright = None
         self.context = None
 
-    # --- Navigation résiliente anti-timeout ---
-
-    async def _check_authenticated(self, page):
-        current = page.url.lower()
-        if "/login" in current or "checkpoint" in current or "recover" in current:
-            raise FacebookAuthError(
-                f"Session Facebook expirée ou bloquée (URL: {page.url}). "
-                "Réinjecte des cookies frais dans MySQL."
-            )
-        has_login_form = await page.locator('input[name="email"], input[name="pass"]').count()
-        if has_login_form > 0:
-            raise FacebookAuthError(
-                "Facebook affiche le formulaire de connexion (cookies expirés ou invalides)."
-            )
-
-    async def _wait_for_hydration(self, page, max_wait_sec: int = 12):
-        """Attend dynamiquement que React injecte les blocs de texte dans le DOM sans bloquer."""
-        for _ in range(max_wait_sec):
-            try:
-                count = await page.evaluate("""() => {
-                    return document.querySelectorAll('div[dir="auto"], div[role="article"], div[data-ad-preview="message"]').length;
-                }""")
-                if count >= 3:
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(1)
+    # --- Outils internes ---
 
     async def _goto(self, page, url: str, wait_selector: Optional[str] = None):
-        """Navigation avec wait_until='commit' et interception des timeouts pour ne jamais crasher."""
-        try:
-            await page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            print(f"[HUB IA] Navigation lente sur {url}, poursuite avec le DOM partiel.")
+        """Navigation tolérante : on n'attend que 'commit', puis un sélecteur précis."""
+        await page.goto(url, wait_until="commit", timeout=GOTO_TIMEOUT_MS)
+        await asyncio.sleep(3)
 
-        await asyncio.sleep(2.5)
-        await self._check_authenticated(page)
+        current = page.url.lower()
+        if "/login" in current or "checkpoint" in current:
+            raise FacebookAuthError(
+                f"Session Facebook invalide (redirigé vers {page.url}). "
+                "Réexporte les cookies et mets à jour fb_sessions."
+            )
 
         if wait_selector:
             try:
-                await page.wait_for_selector(wait_selector, timeout=8000)
+                await page.wait_for_selector(wait_selector, timeout=15000)
             except PlaywrightTimeoutError:
-                pass
-
-        await self._wait_for_hydration(page, max_wait_sec=10)
+                print(f"[HUB IA] Sélecteur {wait_selector!r} non apparu, on continue.")
 
     async def _with_page(self, label: str, action: Callable[[Any], Awaitable[Any]]):
+        """Exécute `action(page)` sous verrou, avec nouvelle tentative et relance de Chromium."""
         async with self.lock:
             last_error: Optional[Exception] = None
             for attempt in range(ATTEMPTS):
@@ -392,11 +359,8 @@ class UniversalFacebookBridge:
                     f.write(base64.b64decode(clean_b64))
                 return temp_path
 
-            if media_url and os.path.exists(media_url):
-                return media_url
-
-            if not media_url or not media_url.lower().startswith(("http://", "https://")):
-                raise ValueError("media_url doit être une URL http(s) valide.")
+            if not media_url.lower().startswith(("http://", "https://")):
+                raise ValueError("media_url doit être une URL http(s).")
             async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
                 resp = await client.get(media_url)
                 resp.raise_for_status()
@@ -409,191 +373,80 @@ class UniversalFacebookBridge:
             raise RuntimeError(f"Échec préparation média : {e}")
 
     async def _extract_dom_posts(self, page, limit: int) -> List[Dict[str, Any]]:
-        """Découpe et nettoie les posts Facebook (anti-obfuscation Unicode et support du nouveau DOM React)."""
         return await page.evaluate("""(maxItems) => {
-            const cleanString = (str) => {
-                if (!str) return "";
-                return str
-                    .replace(/[\\u034f\\u200b\\u200c\\u200d\\u200e\\u200f\\ufeff]/g, "")
-                    .replace(/(Facebook\\s*){2,}/gi, " ")
-                    .replace(/\\b([a-zA-Z0-9]\\s+){5,}[a-zA-Z0-9]\\b/g, " ")
-                    .replace(/\\s+/g, " ")
-                    .trim();
-            };
-
             const getCleanText = (node) => {
-                if (!node) return "";
                 const clone = node.cloneNode(true);
-                clone.querySelectorAll('script, style, noscript, svg, template, form, nav, header').forEach(s => s.remove());
-                clone.querySelectorAll('div, p, span, br, li, h1, h2, h3, h4').forEach(el => {
-                    el.appendChild(document.createTextNode(" "));
-                });
-                return cleanString(clone.textContent || "");
+                const scriptNodes = clone.querySelectorAll('script, style, noscript, svg, template');
+                scriptNodes.forEach(s => s.remove());
+                return (clone.textContent || "").replace(/\\s+/g, " ").trim();
             };
 
-            const PERMALINK_HINTS = [
-                '/posts/', '/videos/', '/reel/', '/permalink/',
-                '/share/p/', '/share/v/', '/share/r/',
-                'story_fbid=', 'pfbid', '/photo'
-            ];
-
-            const extractPermalink = (container) => {
-                let node = container;
-                for (let depth = 0; node && depth < 10; depth++) {
-                    const links = Array.from(node.querySelectorAll('a[href]'));
-                    for (const a of links) {
-                        const href = a.href || "";
-                        if (PERMALINK_HINTS.some(h => href.includes(h))) {
-                            return href.includes('story_fbid=') ? href : href.split('?')[0];
-                        }
-                    }
-                    node = node.parentElement;
-                    if (!node) break;
-                    const role = node.getAttribute('role');
-                    if (role === 'feed' || role === 'main') break;
-                    if (node.querySelectorAll('div[data-ad-preview="message"]').length > 1) break;
-                }
-                return null;
-            };
-
-            const isNoiseUI = (txt) => {
-                const lower = txt.toLowerCase();
-                if (lower.startsWith("find friends") || lower.startsWith("retrouver des amis")) return true;
-                if (lower.startsWith("create a post") || lower.startsWith("what's on your mind")) return true;
-                if (lower.startsWith("filters") && txt.length < 120) return true;
-                if (lower.includes("unread notifications") && lower.includes("marketplace") && txt.length < 300) return true;
-                return false;
-            };
-
-            let candidates = [];
-            const roleArticles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-pagelet^="FeedUnit"]'));
-            if (roleArticles.length > 0) {
-                candidates.push(...roleArticles);
-            }
-
-            const feedContainer = document.querySelector('div[role="feed"]');
-            if (feedContainer) {
-                for (const child of Array.from(feedContainer.children)) {
-                    if (child.tagName === 'DIV') candidates.push(child);
-                }
-            }
-
-            const mainArea = document.querySelector('div[role="main"]') || document.body;
-            const authorHeaders = Array.from(mainArea.querySelectorAll('h3, h4'));
-            for (const h of authorHeaders) {
-                let card = h;
-                for (let i = 0; i < 6; i++) {
-                    if (!card.parentElement || card.parentElement === mainArea || card.parentElement.getAttribute('role') === 'feed') break;
-                    card = card.parentElement;
-                }
-                if (card && card !== mainArea && card !== document.body) {
-                    candidates.push(card);
-                }
-            }
-
-            const msgBlocks = Array.from(mainArea.querySelectorAll('div[data-ad-preview="message"], div[dir="auto"]'));
-            for (const mb of msgBlocks) {
-                const msgTxt = cleanString(mb.textContent || "");
-                if (msgTxt.length >= 35 && !isNoiseUI(msgTxt)) {
-                    let card = mb;
-                    for (let i = 0; i < 5; i++) {
-                        if (!card.parentElement || card.parentElement === mainArea || card.parentElement.getAttribute('role') === 'feed') break;
-                        card = card.parentElement;
-                    }
-                    candidates.push(card);
-                }
-            }
-
+            const articles = Array.from(document.querySelectorAll('div[role="article"], article, div[data-story-id]'));
             const results = [];
-            const seenSignatures = new Set();
+            const seenTexts = new Set();
 
-            for (const el of candidates) {
+            for (const el of articles) {
                 if (results.length >= maxItems) break;
-                if (!el) continue;
 
-                const dirAutos = Array.from(el.querySelectorAll('div[data-ad-preview="message"], div[dir="auto"]'))
-                    .map(n => getCleanText(n))
-                    .filter(t => t.length >= 20 && !isNoiseUI(t));
+                const rawText = getCleanText(el);
+                if (rawText.length < 15 || seenTexts.has(rawText.slice(0, 100))) continue;
+                seenTexts.add(rawText.slice(0, 100));
 
-                let postContent = "";
-                if (dirAutos.length > 0) {
-                    const uniqueParts = [];
-                    for (const part of dirAutos) {
-                        if (!uniqueParts.some(u => u.includes(part) || part.includes(u))) {
-                            uniqueParts.push(part);
-                        }
-                    }
-                    postContent = uniqueParts.join(" — ");
-                } else {
-                    postContent = getCleanText(el);
-                }
-
-                postContent = postContent
-                    .replace(/^.*?Share a photo, video or write something\\s*(Feed posts)?\\s*/i, "")
-                    .replace(/See translation.*$/i, "")
-                    .trim();
-
-                if (postContent.length < 25 || isNoiseUI(postContent)) continue;
-
-                const sig = postContent.slice(0, 80).toLowerCase();
-                let isDup = false;
-                for (const existing of seenSignatures) {
-                    if (existing.includes(sig.slice(0, 45)) || sig.includes(existing.slice(0, 45))) {
-                        isDup = true;
-                        break;
-                    }
-                }
-                if (isDup) continue;
-                seenSignatures.add(sig);
-
-                let author = "Publication Facebook";
-                const headings = Array.from(el.querySelectorAll('h2, h3, h4, strong, a[role="link"] span'));
-                for (const heading of headings) {
-                    const hText = getCleanText(heading).replace(/\\s*·\\s*(Follow|Suivre).*$/i, "").trim();
-                    if (hText && hText.length > 1 && hText.length < 75
-                        && !hText.toLowerCase().includes("notifications")
-                        && !/status indicator|online|active now|en ligne/i.test(hText)) {
-                        author = hText;
+                let postUrl = null;
+                const links = Array.from(el.querySelectorAll('a[href]'));
+                for (const a of links) {
+                    const href = a.href;
+                    if (href.includes('/posts/') || href.includes('/videos/') || href.includes('/reel/') || href.includes('story_fbid=') || href.includes('/permalink/')) {
+                        postUrl = href.split('?')[0];
+                        if (href.includes('story_fbid=')) postUrl = href;
                         break;
                     }
                 }
 
-                const postUrl = extractPermalink(el) || window.location.href;
+                let author = "Auteur Facebook";
+                const heading = el.querySelector('h3, h4, strong, a');
+                if (heading) {
+                    author = getCleanText(heading);
+                }
 
                 results.push({
                     author: author,
                     post_url: postUrl,
-                    content: postContent.slice(0, 1500)
+                    content: rawText.slice(0, 1500)
                 });
             }
-
             return results;
         }""", limit)
 
-    # --- Actions Facebook exposées aux IA ---
+    # --- Actions Facebook ---
 
     async def search(self, query: str, category: str = "posts", limit: int = 5) -> List[Dict[str, Any]]:
-        path = SEARCH_PATHS.get(category.lower(), "posts")
-        encoded_q = urllib.parse.quote(query)
-        target_url = f"https://www.facebook.com/search/{path}/?q={encoded_q}"
+        path = SEARCH_PATHS.get(category, "posts")
+        target_url = f"https://www.facebook.com/search/{path}/?q={urllib.parse.quote(query)}"
 
         async def action(page):
-            await self._goto(page, target_url, wait_selector='div[role="main"]')
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, 1300)")
-                await asyncio.sleep(1.5)
+            await self._goto(page, target_url, wait_selector='div[role="article"]')
+            await page.evaluate("window.scrollBy(0, 1000)")
+            await asyncio.sleep(2)
 
-            return await self._extract_dom_posts(page, limit)
+            posts = await self._extract_dom_posts(page, limit)
+            if not posts:
+                fallback_text = await page.evaluate("""() => {
+                    const clone = document.body.cloneNode(true);
+                    clone.querySelectorAll('script, style, noscript, svg').forEach(s => s.remove());
+                    return (clone.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 2000);
+                }""")
+                if fallback_text:
+                    posts = [{"author": "Résultat extrait", "post_url": target_url, "content": fallback_text}]
+            return posts
 
         return await self._with_page("SEARCH", action)
 
     async def get_feed(self, limit: int = 5) -> List[Dict[str, Any]]:
         async def action(page):
-            await self._goto(page, "https://www.facebook.com/?sk=h_chr", wait_selector='div[role="main"]')
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, 1400)")
-                await asyncio.sleep(1.8)
-
+            await self._goto(page, "https://www.facebook.com/", wait_selector='div[role="article"]')
+            await page.evaluate("window.scrollBy(0, 1200)")
+            await asyncio.sleep(2)
             return await self._extract_dom_posts(page, limit)
 
         return await self._with_page("FEED", action)
@@ -611,13 +464,11 @@ class UniversalFacebookBridge:
                 temp_media_path = await self._prepare_temp_media(media_url, media_base64, filename)
 
                 await self._goto(page, "https://www.facebook.com/", wait_selector='div[role="main"]')
-                await asyncio.sleep(2)
 
                 composer_triggers = [
                     'div[role="button"]:has-text("Que voulez-vous dire")',
                     'div[role="button"]:has-text("Exprimez-vous")',
                     'div[role="button"]:has-text("What\'s on your mind")',
-                    'span:has-text("What\'s on your mind")',
                     'span:has-text("Que voulez-vous dire")',
                 ]
                 clicked = False
@@ -629,20 +480,16 @@ class UniversalFacebookBridge:
                         break
 
                 if not clicked:
-                    raise RuntimeError("Bouton de création de post introuvable sur la page d'accueil.")
+                    raise RuntimeError("Bouton de création de post introuvable.")
 
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
                 if temp_media_path:
                     file_inputs = page.locator('input[type="file"]')
-                    if await file_inputs.count() == 0:
-                        media_btn = page.locator('div[aria-label*="Photo/vidéo"], div[aria-label*="Photo/video"]').first
-                        if await media_btn.count() > 0:
-                            await media_btn.click(force=True)
-                            await asyncio.sleep(2)
-                    await page.locator('input[type="file"]').first.set_input_files(temp_media_path)
-                    is_video = temp_media_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
-                    await asyncio.sleep(10 if is_video else 4)
+                    if await file_inputs.count() > 0:
+                        await file_inputs.first.set_input_files(temp_media_path)
+                        is_video = temp_media_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
+                        await asyncio.sleep(10 if is_video else 4)
 
                 textbox = page.locator(
                     'div[role="dialog"] div[role="textbox"][contenteditable="true"], '
@@ -653,17 +500,12 @@ class UniversalFacebookBridge:
                 await asyncio.sleep(2)
 
                 publish_btn = page.locator(
-                    'div[aria-label="Publier"], div[aria-label="Post"], '
-                    'div[role="button"]:has-text("Publier"), div[role="button"]:has-text("Post")'
+                    'div[aria-label="Publier"], div[aria-label="Post"], div[role="button"]:has-text("Publier")'
                 ).first
                 await publish_btn.click(force=True)
                 await asyncio.sleep(5)
 
-                return {
-                    "published": True,
-                    "text_preview": content[:80],
-                    "media_attached": bool(temp_media_path),
-                }
+                return {"published": True, "text_preview": content[:80], "media_attached": bool(temp_media_path)}
             finally:
                 if temp_media_path and os.path.exists(temp_media_path):
                     try:
@@ -675,14 +517,11 @@ class UniversalFacebookBridge:
 
     async def comment_post(self, post_url: str, comment_text: str) -> Dict[str, Any]:
         async def action(page):
-            await self._goto(page, post_url, wait_selector='div[role="main"]')
-            await asyncio.sleep(2)
+            await self._goto(page, post_url, wait_selector='div[role="article"]')
 
             comment_boxes = [
                 'div[aria-label*="Écrivez un commentaire"]',
                 'div[aria-label*="Write a comment"]',
-                'div[aria-label*="Répondre"]',
-                'div[aria-label*="Reply"]',
                 'div[role="textbox"][contenteditable="true"]',
             ]
             target_box = None
@@ -693,7 +532,7 @@ class UniversalFacebookBridge:
                     break
 
             if not target_box:
-                raise RuntimeError("Zone de commentaire introuvable sur cette publication.")
+                raise RuntimeError("Zone de commentaire introuvable.")
 
             await target_box.click(force=True)
             await target_box.fill(comment_text)
@@ -707,8 +546,7 @@ class UniversalFacebookBridge:
 
     async def like_post(self, post_url: str) -> Dict[str, Any]:
         async def action(page):
-            await self._goto(page, post_url, wait_selector='div[role="main"]')
-            await asyncio.sleep(2)
+            await self._goto(page, post_url, wait_selector='div[role="article"]')
 
             like_selectors = [
                 'div[aria-label="J’aime"][role="button"]',
@@ -722,28 +560,27 @@ class UniversalFacebookBridge:
                     await asyncio.sleep(2)
                     return {"liked": True, "post_url": post_url}
 
-            raise RuntimeError("Bouton J'aime introuvable ou publication déjà likée.")
+            raise RuntimeError("Bouton J'aime introuvable ou déjà cliqué.")
 
         return await self._with_page("LIKE", action)
 
     async def read_post_and_comments(self, post_url: str, max_comments: int = 10) -> Dict[str, Any]:
         async def action(page):
-            await self._goto(page, post_url, wait_selector='div[role="main"]')
-            await asyncio.sleep(2)
+            await self._goto(page, post_url, wait_selector='div[role="article"]')
 
             data = await page.evaluate("""(maxComm) => {
-                const clean = (s) => (s || "")
-                    .replace(/[\\u034f\\u200b\\u200c\\u200d\\ufeff]/g, "")
-                    .replace(/(Facebook\\s*){2,}/gi, " ")
-                    .replace(/\\s+/g, " ")
-                    .trim();
-
-                const blocks = Array.from(document.querySelectorAll('div[dir="auto"]'))
-                    .map(el => clean(el.textContent))
-                    .filter(t => t.length > 5);
-
-                const mainPost = blocks.length > 0 ? blocks[0] : "";
-                const comments = blocks.slice(1, maxComm + 1);
+                const getCleanText = (node) => {
+                    const clone = node.cloneNode(true);
+                    clone.querySelectorAll('script, style, noscript, svg, template').forEach(s => s.remove());
+                    return (clone.textContent || "").replace(/\\s+/g, " ").trim();
+                };
+                const articles = Array.from(document.querySelectorAll('div[role="article"]'));
+                const mainPost = articles.length > 0 ? getCleanText(articles[0]) : "";
+                const comments = [];
+                for (let i = 1; i < articles.length && comments.length < maxComm; i++) {
+                    const txt = getCleanText(articles[i]);
+                    if (txt.length > 2) comments.push(txt.slice(0, 600));
+                }
                 return { main_post: mainPost.slice(0, 2500), comments: comments };
             }""", max_comments)
             return {"post_url": post_url, **data}
@@ -785,8 +622,11 @@ class UniversalFacebookBridge:
 bridge = UniversalFacebookBridge()
 
 
-# --- INTÉGRATION MCP (CLAUDE / CLIENTS MCP SSE) ---
+# --- INTÉGRATION MCP ---
 
+# Les versions récentes du SDK activent une protection "DNS rebinding" qui refuse
+# les requêtes dont le Host n'est pas localhost (erreur 421 sur Render).
+# Le serveur est de toute façon protégé par la clé API (voir middleware plus bas).
 try:
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -802,13 +642,6 @@ except (ImportError, TypeError):
 async def facebook_search(query: str, category: str = "posts", limit: int = 5) -> str:
     """Recherche des publications sur Facebook par mots-clés."""
     res = await bridge.search(query=query, category=category, limit=limit)
-    return json.dumps(res, ensure_ascii=False)
-
-
-@mcp_server.tool()
-async def facebook_feed(limit: int = 5) -> str:
-    """Lit les publications récentes du fil d'actualité Facebook."""
-    res = await bridge.get_feed(limit=limit)
     return json.dumps(res, ensure_ascii=False)
 
 
@@ -848,45 +681,29 @@ async def facebook_analyze_video(video_url: str) -> str:
 
 
 class MCPAuthMiddleware:
-    """
-    /sse      : clé acceptée via header (Authorization / X-API-Key) OU via ?key=...
-                (Claude.ai ne peut pas envoyer de header sur un connecteur custom).
-    /messages : exige un session_id (UUID aléatoire obtenu uniquement via /sse authentifié).
-    """
+    """Protège les chemins MCP (/sse et /messages) avec la même clé API que le REST.
+    Middleware ASGI pur pour ne pas casser le streaming SSE."""
+
+    PROTECTED_PREFIXES = ("/sse", "/messages")
 
     def __init__(self, app):
         self.app = app
 
-    async def _deny(self, send):
-        body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 403,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        })
-        await send({"type": "http.response.body", "body": body})
-
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            path = scope["path"]
-            qs = urllib.parse.parse_qs(scope.get("query_string", b"").decode())
-
-            if path.startswith("/sse"):
-                headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-                key = (qs.get("key") or [None])[0]
-                ok = _token_is_valid(headers.get("authorization"), headers.get("x-api-key"))
-                if not ok and key:
-                    ok = hmac.compare_digest(key.encode(), API_KEY.encode())
-                if not ok:
-                    return await self._deny(send)
-
-            elif path.startswith("/messages"):
-                if not qs.get("session_id"):
-                    return await self._deny(send)
-
+        if scope["type"] == "http" and scope["path"].startswith(self.PROTECTED_PREFIXES):
+            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            if not _token_is_valid(headers.get("authorization"), headers.get("x-api-key")):
+                body = json.dumps({"detail": "Clé API invalide ou manquante."}).encode()
+                await send({
+                    "type": "http.response.start",
+                    "status": 403,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
         await self.app(scope, receive, send)
 
 
@@ -901,8 +718,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Universal Facebook AI Hub",
-    description="API passerelle universelle multi-agents IA (Gemini, Claude, ChatGPT) avec support REST et MCP SSE.",
-    version="3.5.0",
+    description="API passerelle universelle multi-agents IA avec support REST et MCP SSE.",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
@@ -934,6 +751,98 @@ async def api_health():
         "browser_connected": bridge.browser is not None and bridge.browser.is_connected(),
         "queue_locked": bridge.lock.locked(),
     }
+
+
+@app.get("/debug", summary="Diagnostic navigateur", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
+async def api_debug():
+    out: Dict[str, Any] = {}
+    async with bridge.lock:
+        page = None
+        try:
+            page = await bridge.get_page()
+            out["cookies_in_context"] = len(await bridge.context.cookies())
+            for name, url in [("example", "https://example.com"), ("facebook", "https://www.facebook.com/")]:
+                t = time.time()
+                try:
+                    await page.goto(url, wait_until="commit", timeout=30000)
+                    await asyncio.sleep(5)
+                    out[name] = {
+                        "ok": True,
+                        "secs": round(time.time() - t, 1),
+                        "final_url": page.url,
+                        "title": await page.title(),
+                    }
+                except Exception as e:
+                    out[name] = {"ok": False, "secs": round(time.time() - t, 1), "error": str(e)[:200]}
+        except Exception as e:
+            out["fatal"] = str(e)[:300]
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+    return out
+
+
+@app.get("/inspect", summary="Diagnostic texte de la page (sélecteurs, erreurs, crash)", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
+async def api_inspect(url: str = "https://www.facebook.com/", wait: int = 15):
+    wait = max(3, min(wait, 40))
+    events: List[str] = []
+    async with bridge.lock:
+        page = None
+        try:
+            page = await bridge.get_page()
+            page.on("crash", lambda *_: events.append("PAGE CRASH (mémoire ?)"))
+            page.on("pageerror", lambda e: events.append(f"pageerror: {str(e)[:150]}"))
+            await page.goto(url, wait_until="commit", timeout=30000)
+            await asyncio.sleep(wait)
+            info = await page.evaluate("""() => {
+                const txt = (document.body && document.body.innerText) || "";
+                const n = (sel) => document.querySelectorAll(sel).length;
+                return {
+                    text_len: txt.length,
+                    text_head: txt.replace(/\\s+/g, " ").slice(0, 700),
+                    html_len: document.documentElement.outerHTML.length,
+                    counts: {
+                        article: n('div[role="article"]'),
+                        feed: n('div[role="feed"]'),
+                        main: n('div[role="main"]'),
+                        post_links: n('a[href*="/posts/"]'),
+                        login_form: n('input[name="email"]')
+                    }
+                };
+            }""")
+            return {"final_url": page.url, "title": await page.title(), "events": events[:10], **info}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:300])
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+
+@app.get("/screenshot", summary="Capture d'écran de ce que voit Chromium", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
+async def api_screenshot(url: str = "https://www.facebook.com/", wait: int = 12):
+    wait = max(3, min(wait, 40))
+    async with bridge.lock:
+        page = None
+        try:
+            page = await bridge.get_page()
+            await page.goto(url, wait_until="commit", timeout=30000)
+            await asyncio.sleep(wait)
+            png = await page.screenshot(type="png")
+            return Response(content=png, media_type="image/png", headers={"X-Final-URL": page.url})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)[:300])
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
 
 @app.post("/reload-cookies", summary="Recharger les cookies depuis MySQL", tags=["Système"], dependencies=[Depends(verify_universal_auth)])
@@ -1037,14 +946,14 @@ async def api_ai_manifest(request: Request):
         "mcp_sse_url": f"{base_url}/sse",
         "universal_tools": [
             {"name": "facebook_search", "endpoint": f"{base_url}/search", "method": "POST", "parameters": SearchRequest.model_json_schema()},
-            {"name": "facebook_feed", "endpoint": f"{base_url}/feed", "method": "GET", "parameters": {"limit": "integer (1-15)"}},
             {"name": "facebook_publish", "endpoint": f"{base_url}/publish", "method": "POST", "parameters": PublishRequest.model_json_schema()},
             {"name": "facebook_comment", "endpoint": f"{base_url}/comment", "method": "POST", "parameters": CommentRequest.model_json_schema()},
             {"name": "facebook_like", "endpoint": f"{base_url}/like", "method": "POST", "parameters": LikeRequest.model_json_schema()},
-            {"name": "facebook_read_post", "endpoint": f"{base_url}/read-post", "method": "POST", "parameters": ReadPostRequest.model_json_schema()},
             {"name": "facebook_analyze_video", "endpoint": f"{base_url}/analyze-video", "method": "POST", "parameters": VideoAnalyzeRequest.model_json_schema()},
         ],
     }
 
 
+# IMPORTANT : le montage MCP doit rester TOUT EN BAS, après toutes les routes.
+# Les clients MCP se connectent sur https://<ton-app>.onrender.com/sse
 app.mount("/", mcp_server.sse_app())
