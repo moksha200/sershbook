@@ -1,12 +1,18 @@
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8090 \
+    LOW_MEMORY=1
 
-COPY . .
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
 
-EXPOSE 10000
+COPY index.py mcp_stdio_bridge.py test_suite.py mcp_configs.json /app/
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+EXPOSE 8090
+
+CMD ["sh", "-c", "uvicorn index:app --host 0.0.0.0 --port ${PORT:-8090}"]
