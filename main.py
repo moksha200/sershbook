@@ -805,15 +805,31 @@ bridge = UniversalFacebookBridge()
 # Les versions récentes du SDK activent une protection "DNS rebinding" qui refuse
 # les requêtes dont le Host n'est pas localhost (erreur 421 sur Render).
 # Le serveur est de toute façon protégé par la clé API (voir middleware plus bas).
-try:
-    from mcp.server.transport_security import TransportSecuritySettings
+# stateless_http + json_response : le transport HTTP streamable survit aux
+# redémarrages / mises en veille de Render (aucune session à retrouver).
+def _make_mcp() -> FastMCP:
+    attempts: List[Dict[str, Any]] = []
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
 
-    mcp_server = FastMCP(
-        "Facebook Bridge MCP",
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-    )
-except (ImportError, TypeError):
-    mcp_server = FastMCP("Facebook Bridge MCP")
+        attempts.append({
+            "transport_security": TransportSecuritySettings(enable_dns_rebinding_protection=False),
+            "stateless_http": True,
+            "json_response": True,
+        })
+    except ImportError:
+        pass
+    attempts.append({"stateless_http": True, "json_response": True})
+    attempts.append({})
+    for kwargs in attempts:
+        try:
+            return FastMCP("Facebook Bridge MCP", **kwargs)
+        except TypeError:
+            continue
+    return FastMCP("Facebook Bridge MCP")
+
+
+mcp_server = _make_mcp()
 
 
 @mcp_server.tool()
@@ -859,7 +875,7 @@ async def facebook_analyze_video(video_url: str) -> str:
 
 
 class MCPAuthMiddleware:
-    """Protège les chemins MCP (/sse et /messages) avec la même clé API que le REST.
+    """Protège les chemins MCP (/sse, /messages et /mcp) avec la même clé API que le REST.
 
     Accepte la clé dans les headers (Authorization / X-API-Key) OU dans l'URL (?key=...),
     car beaucoup de connecteurs MCP (dont Claude.ai) ne savent pas envoyer de headers.
@@ -867,7 +883,7 @@ class MCPAuthMiddleware:
     émis par une connexion /sse déjà authentifiée (identifiant aléatoire non devinable).
     Middleware ASGI pur pour ne pas casser le streaming SSE."""
 
-    PROTECTED_PREFIXES = ("/sse", "/messages")
+    PROTECTED_PREFIXES = ("/sse", "/messages", "/mcp")
     MAX_SESSIONS = 500
     SESSION_RE = re.compile(rb"session_id=([0-9a-fA-F]{16,64})")
 
@@ -925,13 +941,40 @@ class MCPAuthMiddleware:
         await self.app(scope, receive, send)
 
 
+class MCPRouter:
+    """Un seul montage à la racine pour deux transports MCP :
+    /mcp  -> HTTP streamable (recommandé, utilisé par Claude.ai)
+    /sse + /messages -> SSE (anciens clients)."""
+
+    def __init__(self, sse_app, http_app):
+        self.sse_app = sse_app
+        self.http_app = http_app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if self.http_app is not None and (path == "/mcp" or path.startswith("/mcp/")):
+            await self.http_app(scope, receive, send)
+        else:
+            await self.sse_app(scope, receive, send)
+
+
 # --- FASTAPI ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bridge._init_db()
-    yield
-    await bridge.shutdown()
+    try:
+        manager = mcp_server.session_manager  # créé par streamable_http_app()
+    except Exception:
+        manager = None
+    try:
+        if manager is not None:
+            async with manager.run():
+                yield
+        else:
+            yield
+    finally:
+        await bridge.shutdown()
 
 
 app = FastAPI(
@@ -1165,6 +1208,7 @@ async def api_ai_manifest(request: Request):
     return {
         "hub_url": base_url,
         "openapi_schema_url": f"{base_url}/openapi.json",
+        "mcp_http_url": f"{base_url}/mcp",
         "mcp_sse_url": f"{base_url}/sse",
         "universal_tools": [
             {"name": "facebook_search", "endpoint": f"{base_url}/search", "method": "POST", "parameters": SearchRequest.model_json_schema()},
@@ -1177,5 +1221,10 @@ async def api_ai_manifest(request: Request):
 
 
 # IMPORTANT : le montage MCP doit rester TOUT EN BAS, après toutes les routes.
-# Les clients MCP se connectent sur https://<ton-app>.onrender.com/sse
-app.mount("/", mcp_server.sse_app())
+# Claude.ai : https://<ton-app>.onrender.com/mcp?key=...   (SSE : /sse?key=...)
+_sse_asgi = mcp_server.sse_app()
+try:
+    _http_asgi = mcp_server.streamable_http_app()  # doit être appelé avant le démarrage de l'app
+except AttributeError:
+    _http_asgi = None  # ancienne version du SDK : seul /sse sera disponible
+app.mount("/", MCPRouter(_sse_asgi, _http_asgi))
