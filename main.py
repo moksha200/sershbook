@@ -962,7 +962,12 @@ class MCPRouter:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bridge._init_db()
+    try:
+        await bridge._init_db()
+    except Exception as e:
+        # Le serveur démarre quand même (/health, MCP) ; la base sera retentée à la première action.
+        print(f"[HUB IA] Base MySQL injoignable au démarrage : {e}")
+        bridge.db_pool = None
     try:
         manager = mcp_server.session_manager  # créé par streamable_http_app()
     except Exception:
