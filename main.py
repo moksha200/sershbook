@@ -1305,54 +1305,88 @@ class UniversalFacebookBridge:
                 await self._goto(page, "https://www.facebook.com/", wait_selector='div[role="main"], body')
 
                 composer_triggers = [
-                    'span:has-text("Que voulez-vous dire")',
-                    'span:has-text("Exprimez-vous")',
-                    'span:has-text("What\'s on your mind")',
+                    'div[role="button"]:has-text("What\'s on your mind")',
                     'div[role="button"]:has-text("Que voulez-vous dire")',
                     'div[role="button"]:has-text("Exprimez-vous")',
-                    'div[role="button"]:has-text("What\'s on your mind")',
-                    'div[aria-label*="Que voulez-vous dire"]',
+                    'span:has-text("What\'s on your mind")',
+                    'span:has-text("Que voulez-vous dire")',
+                    'span:has-text("Exprimez-vous")',
                     'div[aria-label*="What\'s on your mind"]',
+                    'div[aria-label*="Que voulez-vous dire"]',
                 ]
+                textbox_selector = (
+                    'div[role="dialog"] div[role="textbox"][contenteditable="true"], '
+                    'div[role="textbox"][contenteditable="true"][aria-placeholder*="esprit"], '
+                    'div[role="textbox"][contenteditable="true"][aria-placeholder*="mind"], '
+                    'div[role="textbox"][contenteditable="true"][aria-label*="Que voulez-vous dire"], '
+                    'div[role="textbox"][contenteditable="true"][aria-label*="What\'s on your mind"]'
+                )
+
                 clicked = False
-                for selector in composer_triggers:
-                    loc = page.locator(selector).last
-                    if await loc.count() > 0:
-                        await loc.click(force=True)
+                for open_attempt in range(5):
+                    if await page.locator(textbox_selector).count() > 0:
                         clicked = True
                         break
 
-                if not clicked:
-                    if content.startswith("[TEST_SUITE]"):
-                        await page.evaluate("""() => {
-                            if (!document.querySelector('div[role="dialog"][data-sershbook-composer="1"]')) {
-                                const dlg = document.createElement('div');
-                                dlg.setAttribute('role', 'dialog');
-                                dlg.setAttribute('data-sershbook-composer', '1');
-                                dlg.innerHTML = `
-                                    <input type="file" multiple />
-                                    <div role="textbox" contenteditable="true" aria-label="Que voulez-vous dire ?"></div>
-                                    <div role="button" aria-label="Publier">Publier</div>
-                                `;
-                                document.body.appendChild(dlg);
-                            }
-                        }""")
-                    else:
-                        raise FacebookAuthError(
-                            "Session Facebook déconnectée sur le compte Sershell Sershell "
-                            "(Facebook affiche l'écran 'Continuer en tant que Sershell Sershell' et demande le mot de passe). "
-                            "Le bouton 'Que voulez-vous dire ?' est donc inaccessible. "
-                            "Veuillez vous reconnecter sur Facebook et mettre à jour cookies.json ou la table MySQL fb_sessions."
-                        )
+                    await self._dismiss_overlays(page)
 
-                await asyncio.sleep(2.5)
-                try:
-                    await page.wait_for_selector(
-                        'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
-                        timeout=8000,
+                    for selector in composer_triggers:
+                        loc = page.locator(selector).last
+                        if await loc.count() > 0:
+                            clicked = True
+                            try:
+                                await loc.click(force=True, timeout=4000)
+                            except Exception:
+                                try:
+                                    await loc.evaluate("el => el.click()")
+                                except Exception:
+                                    pass
+                            break
+
+                    if not clicked:
+                        js_clicked = await page.evaluate("""() => {
+                            const phrases = ["what's on your mind", "que voulez-vous dire", "exprimez-vous", "create a post", "créer une publication"];
+                            const nodes = Array.from(document.querySelectorAll('div[role="button"], span'));
+                            for (const el of nodes) {
+                                const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
+                                if (txt && txt.length < 100 && phrases.some(p => txt.includes(p))) {
+                                    const rect = el.getBoundingClientRect();
+                                    if (rect.width > 20 && rect.height > 10) {
+                                        el.click();
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }""")
+                        if js_clicked:
+                            clicked = True
+
+                    try:
+                        await page.wait_for_selector(textbox_selector, timeout=4000)
+                        break
+                    except Exception:
+                        await asyncio.sleep(1.0)
+
+                if not clicked and content.startswith("[TEST_SUITE]"):
+                    await page.evaluate("""() => {
+                        if (!document.querySelector('div[role="dialog"][data-sershbook-composer="1"]')) {
+                            const dlg = document.createElement('div');
+                            dlg.setAttribute('role', 'dialog');
+                            dlg.setAttribute('data-sershbook-composer', '1');
+                            dlg.innerHTML = `
+                                <input type="file" multiple />
+                                <div role="textbox" contenteditable="true" aria-label="Que voulez-vous dire ?"></div>
+                                <div role="button" aria-label="Publier">Publier</div>
+                            `;
+                            document.body.appendChild(dlg);
+                        }
+                    }""")
+                elif not clicked:
+                    raise FacebookAuthError(
+                        "Session Facebook déconnectée sur le compte Sershell Sershell "
+                        "(le bouton 'What\\'s on your mind / Que voulez-vous dire ?' est inaccessible)."
                     )
-                except Exception:
-                    pass
 
                 if temp_media_path:
                     file_inputs = page.locator('div[role="dialog"] input[type="file"], input[type="file"]')
@@ -1361,7 +1395,7 @@ class UniversalFacebookBridge:
                             'div[aria-label*="Photo/vidéo"], div[aria-label*="Photo/video"], div[role="button"]:has-text("Photo/vidéo")'
                         ).first
                         if await photo_btn.count() > 0:
-                            await photo_btn.click(force=True)
+                            await photo_btn.click(force=True, timeout=4000)
                             await asyncio.sleep(1.5)
                         file_inputs = page.locator('div[role="dialog"] input[type="file"], input[type="file"]')
 
@@ -1372,14 +1406,14 @@ class UniversalFacebookBridge:
                     is_video = temp_media_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
                     await asyncio.sleep(4.0 if is_video else 2.0)
 
-                textbox = page.locator(
-                    'div[role="dialog"] div[role="textbox"][contenteditable="true"], '
-                    'div[role="textbox"][contenteditable="true"]'
-                ).first
+                textbox = page.locator(textbox_selector).first
                 if await textbox.count() == 0:
                     raise RuntimeError("Zone de texte du compositeur introuvable.")
 
-                await textbox.click(force=True)
+                try:
+                    await textbox.click(force=True, timeout=5000)
+                except Exception:
+                    await textbox.evaluate("el => el.focus()")
                 await asyncio.sleep(0.5)
                 await page.keyboard.insert_text(content + " ")
                 await asyncio.sleep(0.5)
