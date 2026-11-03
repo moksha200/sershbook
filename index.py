@@ -468,6 +468,54 @@ class UniversalFacebookBridge:
                     except Exception as e:
                         print(f"[HUB IA] Avertissement lecture cookies.json : {e}", file=sys.stderr)
 
+    async def _resolve_chromium_executable(self) -> Optional[str]:
+        """
+        Résout automatiquement le binaire Chromium :
+        1. Si le binaire attendu par la version courante de Playwright existe, l'utilise.
+        2. Sinon, cherche tout binaire Chromium préinstallé dans /ms-playwright ou ~/.cache/ms-playwright
+           (évite le crash sur Render si l'image Docker v1.49.0-noble diffère de la version pip 1.64.1).
+        3. En dernier recours, lance `python -m playwright install chromium`.
+        """
+        import glob as _glob
+
+        try:
+            default_exec = self.playwright.chromium.executable_path
+            if default_exec and os.path.exists(default_exec):
+                return default_exec
+        except Exception:
+            pass
+
+        search_patterns = [
+            "/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell",
+            "/ms-playwright/chromium-*/chrome-*/chrome",
+            os.path.expanduser("~/.cache/ms-playwright/chromium_headless_shell-*/chrome-*/chrome-headless-shell"),
+            os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-*/chrome"),
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+        ]
+        for pattern in search_patterns:
+            matches = sorted(_glob.glob(pattern), reverse=True)
+            for candidate in matches:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    print(f"[HUB IA] Binaire Chromium résolu dynamiquement : {candidate}", file=sys.stderr)
+                    return candidate
+
+        print("[HUB IA] Binaire Chromium absent, installation automatique via playwright install chromium...", file=sys.stderr)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        try:
+            default_exec = self.playwright.chromium.executable_path
+            if default_exec and os.path.exists(default_exec):
+                return default_exec
+        except Exception:
+            pass
+        return None
+
     async def _launch_browser(self):
         """Démarre une instance unique de Chromium avec tous les flags Low-RAM obligatoires."""
         await self.shutdown()
@@ -497,11 +545,16 @@ class UniversalFacebookBridge:
             "--no-default-browser-check",
         ]
 
-        self.browser = await self.playwright.chromium.launch(
-            headless=True,
-            env=custom_env,
-            args=args,
-        )
+        exec_path = await self._resolve_chromium_executable()
+        launch_kwargs: Dict[str, Any] = {
+            "headless": True,
+            "env": custom_env,
+            "args": args,
+        }
+        if exec_path:
+            launch_kwargs["executable_path"] = exec_path
+
+        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
 
         self.context = await self.browser.new_context(
             user_agent=USER_AGENT,
