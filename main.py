@@ -177,13 +177,19 @@ CURATED_PAGES_BY_TOPIC = {
 
 
 def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
-    """Convertit un fichier cookies au format Netscape en liste de dictionnaires JSON."""
+    """Convertit un fichier cookies au format Netscape (tabulations ou espaces) en liste de dictionnaires JSON."""
     cookies: List[Dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        parts = line.split("\t")
+        http_only = False
+        if line.startswith("#HttpOnly_"):
+            http_only = True
+            line = line[len("#HttpOnly_"):].strip()
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t") if "\t" in line else re.split(r"\s+", line, maxsplit=6)
         if len(parts) >= 7:
             domain, _flag, path, secure, expires, name, value = parts[:7]
             cookie: Dict[str, Any] = {
@@ -193,6 +199,8 @@ def _parse_netscape_cookies(text: str) -> List[Dict[str, Any]]:
                 "path": path.strip() or "/",
                 "secure": secure.strip().upper() == "TRUE",
             }
+            if http_only or cookie["name"] in ("xs", "fr", "sb", "datr", "ps_l", "ps_n"):
+                cookie["httpOnly"] = True
             try:
                 exp_val = float(expires.strip())
                 if exp_val > 0:
@@ -687,10 +695,76 @@ class UniversalFacebookBridge:
             await asyncio.sleep(0.5)
         return False
 
+    async def _persist_cookies_to_db(self):
+        """Sauvegarde automatiquement les cookies rafraîchis par Facebook (xs, fr, c_user) dans MySQL et cookies.json."""
+        if not self.context:
+            return
+        try:
+            live_cookies = await self.context.cookies("https://www.facebook.com")
+            names = {c.get("name") for c in live_cookies}
+            if "c_user" not in names or "xs" not in names:
+                return
+            normalized = _normalize_cookies(live_cookies)
+            if not normalized:
+                return
+            if self.db_pool is not None:
+                async with self.db_pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE fb_sessions SET cookies_json = %s WHERE session_name = %s",
+                            (json.dumps(normalized), "main_account"),
+                        )
+            try:
+                with open("cookies.json", "w", encoding="utf-8") as f:
+                    json.dump(normalized, f, indent=2)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[HUB IA] Avertissement sauvegarde cookies : {e}", file=sys.stderr)
+
+    async def _attempt_auto_login(self, page) -> bool:
+        """Tente une reconnexion automatique (clic 'Continuer' ou identifiants FB_EMAIL / FB_PASS) si la session est demandée."""
+        fb_email = os.getenv("FB_EMAIL", "").strip()
+        fb_pass = os.getenv("FB_PASS", "").strip()
+        try:
+            continue_btn = page.locator(
+                'div[role="button"]:has-text("Continuer"), '
+                'div[role="button"]:has-text("Continue"), '
+                'button:has-text("Continuer"), '
+                'button:has-text("Continue")'
+            ).first
+            if await continue_btn.count() > 0 and await continue_btn.is_visible():
+                await continue_btn.click(force=True, timeout=3000)
+                await asyncio.sleep(2.5)
+
+            email_input = page.locator('input[name="email"]').first
+            pass_input = page.locator('input[name="pass"]').first
+            if fb_pass and await pass_input.count() > 0 and await pass_input.is_visible():
+                if fb_email and await email_input.count() > 0 and await email_input.is_visible():
+                    await email_input.fill(fb_email)
+                await pass_input.fill(fb_pass)
+                login_btn = page.locator('button[name="login"], input[type="submit"], div[role="button"]:has-text("Se connecter"), div[role="button"]:has-text("Log In")').first
+                if await login_btn.count() > 0:
+                    await login_btn.click(force=True)
+                else:
+                    await page.keyboard.press("Enter")
+                await asyncio.sleep(4.0)
+
+            if self.context:
+                cks = await self.context.cookies("https://www.facebook.com")
+                if any(c.get("name") == "xs" for c in cks) and "/login" not in (page.url or "").lower():
+                    await self._persist_cookies_to_db()
+                    return True
+        except Exception as e:
+            print(f"[HUB IA] Tentative auto-login échouée : {e}", file=sys.stderr)
+        return False
+
     async def _check_auth(self, page):
         """Détecte immédiatement si la session est expirée (/login, checkpoint, ou présence de input[name='email'] bloquant)."""
         current_url = (page.url or "").lower()
         if "/login" in current_url or "checkpoint" in current_url or "recover/initiate" in current_url:
+            if await self._attempt_auto_login(page):
+                return
             raise FacebookAuthError(
                 f"Session Facebook expirée ou invalide (redirigé vers {page.url}). "
                 "Veuillez mettre à jour les cookies de 'main_account' dans fb_sessions."
@@ -703,6 +777,8 @@ class UniversalFacebookBridge:
                     'div[role="article"], [data-ad-preview="message"], div[role="main"] div[dir="auto"], video'
                 ).count() > 0
                 if not has_content:
+                    if await self._attempt_auto_login(page):
+                        return
                     raise FacebookAuthError(
                         "Session Facebook expirée : formulaire de connexion (input[name='email']) détecté."
                     )
@@ -748,7 +824,9 @@ class UniversalFacebookBridge:
                 page = None
                 try:
                     page = await self.get_page()
-                    return await action(page)
+                    result = await action(page)
+                    await self._persist_cookies_to_db()
+                    return result
                 except FacebookAuthError:
                     raise
                 except Exception as e:
