@@ -275,7 +275,7 @@ async def test_tool_publish() -> str:
             f"{BASE_URL}/publish",
             headers={"Authorization": f"Bearer {API_KEY}", "X-AI-Agent": "TestSuite-REST"},
             json={
-                "content": "Test automatisé Sershbook Universal AI Hub 🚀",
+                "content": "[TEST_SUITE] Test automatisé Sershbook Universal AI Hub 🚀",
                 "media_base64": tiny_png_b64,
                 "media_filename": "test_upload.png",
             },

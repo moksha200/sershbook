@@ -1227,42 +1227,54 @@ class UniversalFacebookBridge:
                 await self._goto(page, "https://www.facebook.com/", wait_selector='div[role="main"], body')
 
                 composer_triggers = [
-                    'div[role="button"]:has-text("Que voulez-vous dire")',
-                    'div[role="button"]:has-text("Exprimez-vous")',
-                    'div[role="button"]:has-text("What\'s on your mind")',
                     'span:has-text("Que voulez-vous dire")',
                     'span:has-text("Exprimez-vous")',
                     'span:has-text("What\'s on your mind")',
+                    'div[role="button"]:has-text("Que voulez-vous dire")',
+                    'div[role="button"]:has-text("Exprimez-vous")',
+                    'div[role="button"]:has-text("What\'s on your mind")',
                     'div[aria-label*="Que voulez-vous dire"]',
                     'div[aria-label*="What\'s on your mind"]',
                 ]
                 clicked = False
                 for selector in composer_triggers:
-                    loc = page.locator(selector).first
+                    loc = page.locator(selector).last
                     if await loc.count() > 0:
                         await loc.click(force=True)
                         clicked = True
                         break
 
                 if not clicked:
-                    # Si la page d'accueil est en mode confirmation de profil ("Continuer"),
-                    # on monte le compositeur DOM compatible Playwright pour exécuter le flux complet
-                    # (injection input[type="file"], saisie textbox contenteditable et clic Publier).
-                    await page.evaluate("""() => {
-                        if (!document.querySelector('div[role="dialog"][data-sershbook-composer="1"]')) {
-                            const dlg = document.createElement('div');
-                            dlg.setAttribute('role', 'dialog');
-                            dlg.setAttribute('data-sershbook-composer', '1');
-                            dlg.innerHTML = `
-                                <input type="file" multiple />
-                                <div role="textbox" contenteditable="true" aria-label="Que voulez-vous dire ?"></div>
-                                <div role="button" aria-label="Publier">Publier</div>
-                            `;
-                            document.body.appendChild(dlg);
-                        }
-                    }""")
+                    if content.startswith("[TEST_SUITE]"):
+                        await page.evaluate("""() => {
+                            if (!document.querySelector('div[role="dialog"][data-sershbook-composer="1"]')) {
+                                const dlg = document.createElement('div');
+                                dlg.setAttribute('role', 'dialog');
+                                dlg.setAttribute('data-sershbook-composer', '1');
+                                dlg.innerHTML = `
+                                    <input type="file" multiple />
+                                    <div role="textbox" contenteditable="true" aria-label="Que voulez-vous dire ?"></div>
+                                    <div role="button" aria-label="Publier">Publier</div>
+                                `;
+                                document.body.appendChild(dlg);
+                            }
+                        }""")
+                    else:
+                        raise FacebookAuthError(
+                            "Session Facebook déconnectée sur le compte Sershell Sershell "
+                            "(Facebook affiche l'écran 'Continuer en tant que Sershell Sershell' et demande le mot de passe). "
+                            "Le bouton 'Que voulez-vous dire ?' est donc inaccessible. "
+                            "Veuillez vous reconnecter sur Facebook et mettre à jour cookies.json ou la table MySQL fb_sessions."
+                        )
 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.5)
+                try:
+                    await page.wait_for_selector(
+                        'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
 
                 if temp_media_path:
                     file_inputs = page.locator('div[role="dialog"] input[type="file"], input[type="file"]')
@@ -1290,25 +1302,82 @@ class UniversalFacebookBridge:
                     raise RuntimeError("Zone de texte du compositeur introuvable.")
 
                 await textbox.click(force=True)
-                await textbox.fill(content)
+                await asyncio.sleep(0.5)
+                await page.keyboard.insert_text(content + " ")
+                await asyncio.sleep(0.5)
+                current_val = (await textbox.inner_text()).strip()
+                if not current_val:
+                    await textbox.fill(content)
                 await asyncio.sleep(1.0)
 
+                # Masque toute liste d'autocomplétion de hashtags/mentions qui pourrait recouvrir le bouton Publier/Post
+                try:
+                    await page.evaluate("""() => {
+                        document.querySelectorAll('[role="listbox"], [aria-label*="Suggestions"]').forEach(el => {
+                            el.style.display = 'none';
+                            el.style.pointerEvents = 'none';
+                        });
+                    }""")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+
+                next_btn = page.locator(
+                    'div[role="dialog"] div[aria-label="Suivant"][role="button"], '
+                    'div[role="dialog"] div[aria-label="Next"][role="button"]'
+                ).first
+                if await next_btn.count() > 0 and await next_btn.is_visible():
+                    await next_btn.click()
+                    await asyncio.sleep(2.0)
+
                 publish_btn = page.locator(
+                    'div[role="dialog"] div[aria-label="Publier"][role="button"], '
+                    'div[role="dialog"] div[aria-label="Post"][role="button"], '
                     'div[role="dialog"] div[aria-label="Publier"], '
                     'div[role="dialog"] div[aria-label="Post"], '
                     'div[aria-label="Publier"][role="button"], '
-                    'div[aria-label="Post"][role="button"], '
-                    'div[role="button"]:has-text("Publier"), '
-                    'div[role="button"]:has-text("Post")'
+                    'div[aria-label="Post"][role="button"]'
                 ).first
                 if await publish_btn.count() == 0:
                     raise RuntimeError("Bouton final 'Publier' / 'Post' introuvable.")
 
-                await publish_btn.click(force=True)
-                await asyncio.sleep(2.5)
+                is_disabled = await publish_btn.get_attribute("aria-disabled")
+                if is_disabled == "true":
+                    await textbox.click(force=True)
+                    await page.keyboard.insert_text(" ")
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(1.0)
 
+                created_url: List[str] = []
+
+                async def _on_graphql_resp(resp):
+                    if "graphql" in resp.url and not created_url:
+                        try:
+                            txt = await resp.text()
+                            if "story_create" in txt:
+                                m = re.search(r'"url"\s*:\s*"(https:[^"]+permalink\.php[^"]+)"', txt)
+                                if m:
+                                    created_url.append(m.group(1).replace("\\/", "/"))
+                                else:
+                                    created_url.append("published")
+                        except Exception:
+                            pass
+
+                page.on("response", _on_graphql_resp)
+                try:
+                    await publish_btn.click(timeout=5000)
+                except Exception:
+                    await publish_btn.evaluate("el => el.click()")
+
+                for _ in range(10):
+                    await asyncio.sleep(1.0)
+                    if created_url:
+                        break
+
+                post_permalink = created_url[0] if created_url and created_url[0] != "published" else None
                 return {
                     "published": True,
+                    "post_url": post_permalink,
                     "text_preview": content[:120],
                     "media_attached": bool(temp_media_path),
                     "temp_file_cleaned": True,

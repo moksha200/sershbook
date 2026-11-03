@@ -1,9 +1,70 @@
-
-
-.facebook.com	TRUE	/	TRUE	1828182293	datr	FIHoaiFwlZkzNmMv7Qdgc70j
-.facebook.com	TRUE	/	TRUE	1828182401	sb	FIHoare79vG7dP6s20FC08aH
-.facebook.com	TRUE	/	TRUE	1794227391	wd	1366x646
-.facebook.com	TRUE	/	TRUE	1825164563	c_user	61596064744368
-.facebook.com	TRUE	/	TRUE	0	presence	C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1793622593083%2C%22v%22%3A1%7D
-.facebook.com	TRUE	/	TRUE	1801404563	fr	115CfV4G3zrIXlxWi.AWdLV1r2UiQqZyaKnBDG-A07zmWj90TzquEXDzHmTC-rQ-w-vwQ.Bq6JmS..AAA.0.0.Bq6JmS.AWeF9NCW03LPjjaTpYOfvSRsWtA
-.facebook.com	TRUE	/	TRUE	1825164563	xs	32%3ANvyxeiGvBPcSaw%3A2%3A1793622398%3A-1%3A-1%3A%3AAc22dk6BlC3HERURGS4u1TBXFJIM1oKDizzUfVY8Zg
+[
+  {
+    "name": "datr",
+    "value": "FIHoaiFwlZkzNmMv7Qdgc70j",
+    "domain": ".facebook.com",
+    "path": "/",
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "sb",
+    "value": "FIHoare79vG7dP6s20FC08aH",
+    "domain": ".facebook.com",
+    "path": "/",
+    "expires": 1828268574.209551,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "wd",
+    "value": "1280x800",
+    "domain": ".facebook.com",
+    "path": "/",
+    "expires": 1794313377.0,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "c_user",
+    "value": "61596064744368",
+    "domain": ".facebook.com",
+    "path": "/",
+    "expires": 1825244576.265168,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "fr",
+    "value": "1vuckc6TbCCIlotwl.AWdKe9IobUKHPG6TzbpupFDTl_3vQvdS3i-8ZY6W5bWrva255dY.Bq6dIf..AAA.0.0.Bq6dIf.AWcMzoxWbsX1YgIuW29zNc7hCKs",
+    "domain": ".facebook.com",
+    "path": "/",
+    "expires": 1801484576.265301,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "xs",
+    "value": "41%3A9owt1DOxr6NgIw%3A2%3A1793708571%3A-1%3A-1%3A%3AAc2d8l7WeSYMcdOEQhCo3NtI6q8xk_fbr0UitHWrrA",
+    "domain": ".facebook.com",
+    "path": "/",
+    "expires": 1825244576.265404,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "presence",
+    "value": "C%7B%22t3%22%3A%5B%5D%2C%22utc3%22%3A1793708578598%2C%22v%22%3A1%7D",
+    "domain": ".facebook.com",
+    "path": "/",
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "Lax"
+  }
+]
